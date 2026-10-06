@@ -1,0 +1,181 @@
+# ============================================================================
+# AOSP GKI 树构建冒烟测试
+#
+# 目的：验证「kernel_common 是完整树、可以直接 make」这个说法到底成不成立。
+#       这个 workflow 不产出可用内核，只回答一个问题：
+#       clone → gki_defconfig → make Image 这条链在干净机器上走不走得通。
+#
+# 为什么需要它：skill 里写的配方如果没有被真正执行过一次，就只是猜测。
+#       本仓库宁可把「未验证」标出来，也不要写一个看起来完整却没人跑过的流程。
+#
+# 只支持手动触发（workflow_dispatch），不会自动跑，不消耗你的日常额度。
+#
+# 预期耗时：4 vCPU 上 40–100 分钟（GKI defconfig 是精简配置）。
+# 预期产物体积：out/ 约 15–25 GB，所以磁盘清理是必需的。
+# ============================================================================
+
+name: gki-build-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'kernel_common 分支'
+        required: true
+        default: 'android16-6.12'
+      clang_version:
+        description: 'AOSP prebuilt clang 版本（r536225 = Android 16-6.12 用的 clang 19.0.1）'
+        required: true
+        default: 'r536225'
+      build_modules:
+        description: '额外构建 modules（更慢，但能验证模块是否能编）'
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355          # 托管 runner 硬上限 6 小时，留 5 分钟余量
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------- 磁盘
+      - name: 环境诊断（清理前）
+        run: |
+          echo "=== CPU ==="; nproc
+          echo "=== RAM ==="; free -h
+          echo "=== 磁盘 ==="; df -h /
+
+      - name: 清理磁盘
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false        # 保留 swap，16 GB 内存 + 并行编译需要它兜底
+
+      - name: 环境诊断（清理后）
+        run: df -h /
+
+      # -------------------------------------------------------------- 依赖
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            bc bison flex libssl-dev libelf-dev \
+            make gcc tar xz-utils zip unzip \
+            cpio rsync python3 dwarves
+
+      # -------------------------------------------------------- 源码与工具链
+      - name: 浅克隆 kernel_common
+        run: |
+          set -eux
+          BRANCH='${{ inputs.branch }}'
+          # 只克隆目标分支：这棵树很大，depth 1 是唯一可行解
+          git clone --depth 1 --branch "$BRANCH" \
+            https://github.com/aosp-mirror/kernel_common.git "$HOME/kernel"
+          cd "$HOME/kernel"
+          echo "--- 路径数（本地）---"
+          git ls-files | wc -l
+          echo "--- 关键文件检查 ---"
+          for f in Makefile kernel/sched/fair.c mm/memory.c init/main.c \
+                   arch/arm64/Kconfig arch/arm64/configs/gki_defconfig \
+                   build.config.gki.aarch64 build.config.common; do
+            if [ -e "$f" ]; then echo "OK   $f"; else echo "MISS $f"; fi
+          done
+
+      - name: 下载 AOSP prebuilt clang
+        run: |
+          set -eux
+          CLANG_VER='${{ inputs.clang_version }}'
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VER}.tar.gz"
+          mkdir -p "$HOME/toolchain/clang-${CLANG_VER}"
+          # gitiles 的 +archive 返回的是目录内容的 tar.gz（不含顶层目录名）
+          curl -fsSL --retry 3 "$URL" \
+            | tar -xzf - -C "$HOME/toolchain/clang-${CLANG_VER}"
+          echo "$HOME/toolchain/clang-${CLANG_VER}/bin" >> "$GITHUB_PATH"
+          "$HOME/toolchain/clang-${CLANG_VER}/bin/clang" --version
+
+      # -------------------------------------------------------------- 构建
+      - name: make gki_defconfig
+        run: |
+          set -eux
+          set -o pipefail
+          cd "$HOME/kernel"
+          make O="$HOME/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig 2>&1 | tail -40
+
+      - name: 记录内核版本与关键 config
+        run: |
+          set -eux
+          cd "$HOME/kernel"
+          echo "kernelrelease = $(make O="$HOME/out" ARCH=arm64 LLVM=1 -s kernelrelease)"
+          echo "--- 本仓库关心的几项 config ---"
+          for k in CONFIG_ZRAM CONFIG_ZRAM_MULTI_COMP CONFIG_F2FS_FS_COMPRESSION \
+                   CONFIG_SCHED_CLASS_EXT CONFIG_LTO_CLANG_THIN CONFIG_CFI_CLANG \
+                   CONFIG_MODVERSIONS CONFIG_DEBUG_INFO_BTF; do
+            printf '%-34s %s\n' "$k" \
+              "$(grep -E "^${k}(=| is not set)" "$HOME/out/.config" || echo '(未出现)')"
+          done
+
+      - name: 构建 Image
+        run: |
+          set -eux
+          cd "$HOME/kernel"
+          # 用 PIPESTATUS 保住 make 的真实退出码，否则 tee 会吞掉它
+          set -o pipefail
+          make O="$HOME/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" Image 2>&1 | tee "$HOME/build.log"
+        continue-on-error: false
+
+      - name: 构建 modules（可选）
+        if: ${{ inputs.build_modules }}
+        run: |
+          set -o pipefail
+          cd "$HOME/kernel"
+          make O="$HOME/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules 2>&1 | tee -a "$HOME/build.log"
+
+      # -------------------------------------------------------------- 产物
+      - name: 检查产物
+        run: |
+          set -eux
+          echo "=== arch/arm64/boot/ ==="
+          ls -la "$HOME/out/arch/arm64/boot/" || true
+          echo "=== 顶层产物 ==="
+          ls -la "$HOME/out/vmlinux" "$HOME/out/System.map" "$HOME/out/.config" \
+                 "$HOME/out/Module.symvers" 2>/dev/null || true
+          echo "=== 内核镜像校验和 ==="
+          for f in "$HOME/out/arch/arm64/boot/Image" "$HOME/out/arch/arm64/boot/Image.lz4"; do
+            if [ -e "$f" ]; then sha256sum "$f"; file "$f"; fi
+          done
+          mkdir -p "$HOME/dist"
+          for f in arch/arm64/boot/Image arch/arm64/boot/Image.lz4 System.map .config Module.symvers; do
+            if [ -e "$HOME/out/$f" ]; then cp "$HOME/out/$f" "$HOME/dist/"; fi
+          done
+          if [ -f "$HOME/dist/Image" ]; then
+            echo "=== 结论：这棵树可以构建出 Image ===" | tee "$HOME/VERDICT.txt"
+          else
+            echo "=== 结论：没有产出 Image ===" | tee "$HOME/VERDICT.txt"
+            exit 1
+          fi
+
+      - name: 失败时输出日志尾部
+        if: failure()
+        run: |
+          echo "=== build.log 末尾 200 行 ==="
+          tail -200 "$HOME/build.log" 2>/dev/null || echo "(没有 build.log)"
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-${{ inputs.branch }}-${{ inputs.clang_version }}-${{ github.run_number }}
+          path: |
+            /home/runner/dist
+            /home/runner/VERDICT.txt
+            /home/runner/build.log
+          if-no-files-found: warn
+          retention-days: 14
