@@ -10,7 +10,15 @@
 #
 # 只支持手动触发（workflow_dispatch），不会自动跑，不消耗你的日常额度。
 #
-# 预期耗时：4 vCPU 上 40–100 分钟（GKI defconfig 是精简配置）。
+# 已知事实（前三轮实测）：
+#   * android16-6.12 = 6.12.52-4k-g105b5745f1d7，72,991 条路径，关键文件齐全，
+#     `make gki_defconfig` 可用 —— 这棵树确实能编，和厂商那棵 2,686 条路径的完全两回事。
+#   * gki_defconfig 里已经是：ZRAM=m、ZRAM_MULTI_COMP=y、F2FS_FS_COMPRESSION=y、
+#     SCHED_CLASS_EXT=y、CFI_CLANG=y、MODVERSIONS=y、DEBUG_INFO_BTF=y；
+#     LTO 在 defconfig 里没有，由 AOSP 的 build.config 用 make 参数打开。
+#   * 唯一会挂的地方是 BTF（见「构建 Image」步骤的注释）。
+#
+# 预期耗时：4 vCPU 上约 25–40 分钟。
 # 预期产物体积：out/ 约 15–25 GB，所以磁盘清理是必需的。
 # ============================================================================
 
@@ -138,14 +146,36 @@ jobs:
               "$(grep -E "^${k}(=| is not set)" "$HOME/out/.config" || echo '(未出现)')"
           done
 
+      # BTF 是这条链上唯一已知会挂的地方。Ubuntu 24.04 的 pahole 是 1.25，
+      # 它给 6.12 编出来的 BTF 会被内核自带的 resolve_btfids 以
+      #   FAILED: load BTF from vmlinux: Invalid argument
+      # 拒收。**这不是「树不完整」**：整棵树已经编到 LD vmlinux 了。
+      # BTF 只影响 /sys/kernel/btf/vmlinux（BPF CO-RE 用），不影响内核能不能启动，
+      # 所以这里退一步关掉它，把剩下的链路跑完。要真正的 BTF，
+      # 正解是用 AOSP 自己的 prebuilt pahole，而不是发行版那个。
       - name: 构建 Image
         run: |
-          set -eux
-          cd "$HOME/kernel"
-          # 用 PIPESTATUS 保住 make 的真实退出码，否则 tee 会吞掉它
           set -o pipefail
-          make O="$HOME/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" Image 2>&1 | tee "$HOME/build.log"
-        continue-on-error: false
+          cd "$HOME/kernel"
+          echo "--- host pahole 版本 ---"
+          pahole --version || echo "(没有 pahole)"
+
+          echo "--- 第一次尝试：完整 gki_defconfig（含 CONFIG_DEBUG_INFO_BTF）---"
+          if make O="$HOME/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" Image 2>&1 | tee "$HOME/build.log"; then
+            echo "BTF_BUILT=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if grep -q 'load BTF from vmlinux' "$HOME/build.log"; then
+            echo "=== 命中已知的 BTF 生成问题 → 关掉 CONFIG_DEBUG_INFO_BTF 重试 ==="
+            ./scripts/config --file "$HOME/out/.config" -d DEBUG_INFO_BTF
+            make O="$HOME/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig > /dev/null
+            echo "BTF_BUILT=0" >> "$GITHUB_ENV"
+            make O="$HOME/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" Image 2>&1 | tee -a "$HOME/build.log"
+          else
+            echo "=== 失败原因不是 BTF，不做降级重试 ==="
+            exit 1
+          fi
 
       - name: 构建 modules（可选）
         if: ${{ inputs.build_modules }}
@@ -172,7 +202,11 @@ jobs:
             if [ -e "$HOME/out/$f" ]; then cp "$HOME/out/$f" "$HOME/dist/"; fi
           done
           if [ -f "$HOME/dist/Image" ]; then
-            echo "=== 结论：这棵树可以构建出 Image ===" | tee "$HOME/VERDICT.txt"
+            {
+              echo "=== 结论：这棵树可以构建出 Image ==="
+              echo "kernelrelease = $(make O="$HOME/out" ARCH=arm64 LLVM=1 -s kernelrelease)"
+              echo "CONFIG_DEBUG_INFO_BTF 被关闭后重试: ${BTF_BUILT:-1}  (0 = 确实是关掉 BTF 才过的)"
+            } | tee "$HOME/VERDICT.txt"
           else
             echo "=== 结论：没有产出 Image ===" | tee "$HOME/VERDICT.txt"
             exit 1
