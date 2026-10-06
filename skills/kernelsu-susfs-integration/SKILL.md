@@ -34,10 +34,16 @@ bash scripts/detect-root.sh
 
 ## 第一步：选对分支（KMI 必须匹配）
 
+下表来自社区线程（XDA Picters Kernel），**是线索不是事实，必须以实机为准**：
+
 | 设备 | Android | Linux | KMI |
 | --- | --- | --- | --- |
 | 小米 17 | Android 16 | 6.12.23 | KMI 5 |
 | 小米 17 | Android 17 | 6.12.69 | KMI 6 |
+
+判断依据只能从设备上取：`uname -r`（Linux 版本）+ `getprop ro.build.version.release`（Android 版本）+ `xiaomi17-device-recon` 采到的 KMI 世代。
+
+> **一条需要留意的矛盾**：AOSP GKI 的 Android 17 分支是 `android17-6.18`（Linux 6.18），而这里说小米 17 的 Android 17 仍在 6.12。两者可能都对（厂商内核分支与 GKI 主线分支不必同步），但这意味着**「Android 版本 → Linux 版本」不能靠推**，必须读实机。
 
 - KernelSU-Next：用 `next` 分支。
 - SUSFS：用 `simonpunk/susfs4ksu` 的 **`gki-6.12`** 分支。
