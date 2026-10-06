@@ -105,6 +105,19 @@ curl -fsSL 'https://android.googlesource.com/platform/prebuilts/clang/host/linux
   | sed '1s/^)]}.'"'"'//' | grep -oE '"name": "clang-r[0-9]+"' | sort -u
 ```
 
+**host 依赖里有一个反直觉的必装项**：`libdw-dev`。6.12 的 `CONFIG_MODVERSIONS` 用新的 `gendwarfksyms`（基于 DWARF 的符号版本）取代了老的 `genksyms`，它 `#include <dwarf.h>`。缺这个包时构建挂在
+
+```
+scripts/gendwarfksyms/gendwarfksyms.h:6:10: fatal error: 'dwarf.h' file not found
+```
+
+——**报错点是内核的 `scripts/` 目录，和「少装一个 -dev 包」这个真正原因看起来毫无关系**。完整的 host 依赖：
+
+```bash
+sudo apt-get install -y bc bison flex libssl-dev libelf-dev libdw-dev \
+  make gcc tar xz-utils zip unzip cpio rsync python3 dwarves
+```
+
 ## GitHub Actions 的硬约束
 
 | 约束 | 数字 / 事实 | 对策 |

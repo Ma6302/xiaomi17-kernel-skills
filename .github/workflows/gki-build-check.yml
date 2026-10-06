@@ -51,7 +51,7 @@ jobs:
       - name: 清理磁盘
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: true
+          preinstalled-runtimes: true   # 旧名 tool-cache，v3 起会移除
           android: true
           dotnet: true
           haskell: true
@@ -66,8 +66,12 @@ jobs:
       - name: 安装构建依赖
         run: |
           sudo apt-get update -qq
+          # libdw-dev 是必须的：内核 6.12 的 CONFIG_MODVERSIONS 走新的
+          # gendwarfksyms（基于 DWARF 的符号版本），它 include <dwarf.h>，
+          # 缺了会以 "fatal error: 'dwarf.h' file not found" 挂掉 scripts 目录，
+          # 报错点与真正的原因（少装一个 -dev 包）看起来毫无关系。
           sudo apt-get install -y -qq \
-            bc bison flex libssl-dev libelf-dev \
+            bc bison flex libssl-dev libelf-dev libdw-dev \
             make gcc tar xz-utils zip unzip \
             cpio rsync python3 dwarves
 
