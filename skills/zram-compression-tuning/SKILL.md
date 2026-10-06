@@ -20,6 +20,8 @@ zram 的 sysfs 接口**在 6.6 / 6.12 / 6.16 之间改过语法**，而且写错
 
 **何时不用**：不知道内核是否支持多算法（先探测）；只想量效果（用 kernel-perf-verification）。
 
+**一条已知的好消息**：AOSP GKI `android16-6.12` 的 `gki_defconfig` 里 **`CONFIG_ZRAM_MULTI_COMP=y` 和 `CONFIG_F2FS_FS_COMPRESSION=y` 都是默认值**（本项目在 CI 上实测），所以小米 17 上大概率已经有 `recomp_algorithm`。但供应商内核不等于 AOSP GKI，**仍然要探**——这只是让你知道探测失败时该怀疑什么。
+
 ## 第一步：探测，不要假设
 
 ```bash

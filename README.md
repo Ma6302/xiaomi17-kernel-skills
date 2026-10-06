@@ -76,9 +76,26 @@ build.env）原样回执给我，并明确列出所有值为 UNKNOWN 的字段�
 
 **在拿到 manifest 之前，「从官方源编一个小米 17 内核」这条路的可行性是未知的。** 现实的替代路径：
 
-1. **改 AOSP GKI 树，而不是厂商树。** `BOARD_USES_GENERIC_KERNEL_IMAGE=true` 意味着设备启动的**本来就是 Google 的 GKI 内核**，厂商树里那个 Image 会被丢弃。而 `aosp-mirror/kernel_common` 是**实测确认的完整树**：`android16-6.12` 有 72,991 条路径（`truncated:false`），含 `Makefile`、`kernel/sched/fair.c`、`mm/memory.c`、`init/main.c`、`arch/arm64/configs/gki_defconfig`、`build.config.gki.aarch64`。要改 zram / f2fs / 调度、要打 KernelSU，改这棵树就够。选哪个分支（`android16-6.12` / `android16-6.12-lts` / `android17-6.18`）**由实机 `uname -r` 与 KMI 世代决定**。
+1. **改 AOSP GKI 树，而不是厂商树。** `BOARD_USES_GENERIC_KERNEL_IMAGE=true` 意味着设备启动的**本来就是 Google 的 GKI 内核**，厂商树里那个 Image 会被丢弃。而 `aosp-mirror/kernel_common` 是**实测确认的完整树**：`android16-6.12` 有 72,991 条路径（`truncated:false`），含 `Makefile`、`kernel/sched/fair.c`、`mm/memory.c`、`init/main.c`、`arch/arm64/configs/gki_defconfig`、`build.config.gki.aarch64`。要改 zram / f2fs / 调度、要打 KernelSU，改这棵树就够。选哪个分支（`android16-6.12` / `android16-6.12-lts` / `android17-6.18`）**由实机 `uname -r` 与 KMI 世代决定**。详见 [`android-kernel-build-on-device`](skills/android-kernel-build-on-device/SKILL.md)。
 2. 用一个**已经拼装好的社区完整树**（自带构建脚本、能直接 `make` 的那种），在其上做功耗/压缩改动。
 3. **先不编译**：zram、调度参数、I/O 参数都能在已 root 的设备上通过 sysfs 调整，`zram-compression-tuning` 覆盖了这部分。**相当一部分压缩收益不需要编译内核。**
+
+> **一个可能让整件事变简单的实测结论**：AOSP GKI `android16-6.12` 的 `gki_defconfig` 里 `CONFIG_ZRAM_MULTI_COMP=y`、`CONFIG_F2FS_FS_COMPRESSION=y`、`CONFIG_SCHED_CLASS_EXT=y` 都已经是默认值。也就是说，「更好的压缩算法 + 更好的功耗控制」这个目标里，**配置层面的东西 GKI 早就开好了**——真正要做的是调 sysfs、选算法、换调度器，而不是先学会编内核。编译内核留给「要改源码」的那些需求（打 KernelSU/SUSFS 补丁、改调度器实现、加厂商驱动）。
+
+### 1.5 「能不能编出来」已经真的验过了
+
+不是推测。仓库里的 [`.github/workflows/gki-build-check.yml`](.github/workflows/gki-build-check.yml) 在 GitHub 托管 runner（4 vCPU / 16 GB）上完整跑通了一次，**32 分 54 秒**：
+
+```
+Image  33,286,656 字节
+sha256 14adb4ec596b7bd4bff6b2ac5658dd06582f5bf5a74417bc2f3937604a5d31b7
+file   Linux kernel ARM64 boot executable Image, little-endian, 4K pages
+make -s kernelrelease = 6.12.52-4k-g105b5745f1d7
+```
+
+代价是两个坑，都写进了 skill：host 要装 **`libdw-dev`**（否则 `gendwarfksyms` 找不到 `dwarf.h`），以及发行版的 `pahole 1.25` 生成不出可用的 BTF（`FAILED: load BTF from vmlinux: Invalid argument`），这个 Image 是**关掉 `CONFIG_DEBUG_INFO_BTF` 后**产出的。
+
+**注意「编得出 Image」≠「能开机」**：AVB/vbmeta、厂商模块加载、KMI 兼容性都还没验。见下面的未核实清单。
 
 ### 2. 手机端编译的内核树通常是 Qualcomm msm-kernel 布局
 
@@ -113,14 +130,26 @@ build.env）原样回执给我，并明确列出所有值为 UNKNOWN 的字段�
 - [firelzrd/zram-ir](https://github.com/firelzrd/zram-ir) —— zram 即时重压
 - [sched-ext/scx](https://github.com/sched-ext/scx) —— 注意 6.12 上可用的 kfunc 集与 7.x 不同
 
+## 已验证清单
+
+这些是**真的跑过**的，不是从文档抄的：
+
+- `aosp-mirror/kernel_common@android16-6.12` 是完整树（72,991 路径，关键文件齐全），`make gki_defconfig` + `make Image` 在干净 runner 上**成功**，32m54s，产出 33 MB 的 ARM64 `Image`
+- 该树 `gki_defconfig` 中 `ZRAM=m`、`ZRAM_MULTI_COMP=y`、`F2FS_FS_COMPRESSION=y`、`SCHED_CLASS_EXT=y`、`CFI_CLANG=y`、`MODVERSIONS=y`、`DEBUG_INFO_BTF=y`（数值取自 CI 实跑日志）
+- `MiCode/Xiaomi_Kernel_OpenSource@popsicle-w-oss` 只有 2,686 条路径、缺 `kernel/sched/fair.c` 等核心文件、无 `build/`、无 `tools/bazel`、无 `arch/arm64/configs/*_defconfig` —— **不能单独构建**
+- 代号 `pudding`=小米 17 / `pandora`=17 Pro / `popsicle`=17 Pro Max，同平台 `canoe`（来自 MiCode issue #40786 等，仍以实机 `getprop` 为准）
+- `scripts/validate-skills.sh` 与 `scripts/install-to-operit.sh` 的行为（9 个 skill 全绿；安装幂等；格式错误会拒绝）
+
 ## 未核实清单（诚实记录）
 
 这些是本仓库**没有**验证、或验证为否的：
 
+- **自编 GKI 的 Image 能否在小米 17 上真正启动** —— **未验证**。AVB/vbmeta 处理、厂商模块（`dio_dma_mapper.ko`/`mi_kernel_monitor.ko`/`gpu_stats.ko`）能否加载、KMI 是否兼容，三样都没验（`android/abi_gki_aarch64_qcom` 在厂商树里，不在 GKI 树里）
 - 官方树按 manifest 拼装后能否真正构建成功 —— **未知**（未做任何同步/构建）
 - `soc-repo`、`common`、`build`(kleaf)、`prebuilts` 是否有公开来源 —— **无法判定**（CLO 对匿名一律 401，含故意编造的不存在路径，故 401 不能证明存在）
 - `LTO`、`KERNEL_VERSION` 在树中的定义位置 —— **未知**（仅在 `build.config.constants` 与 `build.config.msm.common` 中有负证据）
-- 手机端完整编译 6.x arm64 Android 内核的实测耗时/峰值内存 —— **无可靠报告**
+- **手机端**完整编译 6.x arm64 Android 内核的实测耗时/峰值内存 —— **无可靠报告**（CI 上的 32m54s 不能外推到手机；AOSP prebuilt clang 只有 `host/linux-x86`，ARM64 PRoot 里跑不了，见 `android-kernel-build-on-device/references/toolchain-on-arm64.md`）
+- BTF 失败的**确切**根因 —— 目前只知道「Ubuntu 24.04 的 pahole 1.25 复现，关掉 BTF 就过」，未逐一排除其他因素
 - 小米 17 的完整分区表 —— **未由设备转储确认**
 - ARB 计数器是否物理存储于 eFuse/OTP —— **未核实**
 - 「小米 17 自编译 GKI 内核多例卡 bootloop 而 LKM 稳定」—— 流传于 XDA，**未实机复现**

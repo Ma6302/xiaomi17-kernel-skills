@@ -103,14 +103,60 @@ gh api repos/MiCode/Xiaomi_Kernel_OpenSource/git/trees/popsicle-w-oss?recursive=
 
 它自带完整源码与顶层 `Makefile`，**可以直接 `make` 构建**；`build/`（kleaf）与 `prebuilts/` 在别的仓库里，只有走 Bazel 才需要。
 
+**已经在 CI 上真实跑通并产出 Image**（2026-10 实测，4 vCPU 免费 runner，32 分 54 秒）：
+
+```
+Image  33,286,656 字节
+sha256 14adb4ec596b7bd4bff6b2ac5658dd06582f5bf5a74417bc2f3937604a5d31b7
+file   Linux kernel ARM64 boot executable Image, little-endian, 4K pages
+make -s kernelrelease = 6.12.52-4k-g105b5745f1d7
+```
+
+完整链路：`git clone --depth 1 --branch android16-6.12` → `make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig` → `make ... Image`。**确认过的坑只有两个**：
+
+1. **host 依赖要加 `libdw-dev`**。6.12 的 `CONFIG_MODVERSIONS` 用新的 `gendwarfksyms`（基于 DWARF）取代老 `genksyms`，它 `#include <dwarf.h>`。缺了会以
+
+   ```
+   scripts/gendwarfksyms/gendwarfksyms.h:6:10: fatal error: 'dwarf.h' file not found
+   ```
+
+   挂在内核 `scripts/` 目录里——报错点和真正的原因（少装一个 -dev 包）看起来毫无关系。
+
+2. **BTF 是唯一真正卡住的环节**。Ubuntu 24.04 的 `pahole 1.25` 给 6.12 生成的 BTF 会被内核自带的 `resolve_btfids` 以
+
+   ```
+   FAILED: load BTF from vmlinux: Invalid argument
+   make[3]: *** [/home/runner/kernel/scripts/Makefile.vmlinux:45: vmlinux] Error 255
+   ```
+
+   拒收——注意此时整棵树**已经编到 `LD vmlinux` 了，不是树不完整**。解法二选一：用 AOSP 自己的 prebuilt pahole；或 `./scripts/config --file out/.config -d DEBUG_INFO_BTF` 后重跑（只影响 `/sys/kernel/btf/vmlinux`（BPF CO-RE），不影响内核启动）。**上面那个 Image 就是关掉 BTF 后产出的。**
+
 **为什么这是对的方向**：`BOARD_USES_GENERIC_KERNEL_IMAGE=true` 意味着设备启动的**本来就是 Google 的 GKI 内核**，厂商树里那个 Image 是被丢弃的。要改 zram / f2fs / 调度、要打 KernelSU，改 GKI 树就够，根本不需要那棵厂商树。
 
 **选哪个分支由设备的 `uname -r` 与 KMI 世代决定**——先跑 `xiaomi17-device-recon`，不要从网上推。小米 17 的 GKI 是 6.12（KMI 5 或 6 视 Android 版本）还是 6.18，**必须以实机为准**。
 
-**两个还没验证的点**（不要当成结论）：
+**还没验证的一点**：自编 GKI 内核对厂商模块（`dio_dma_mapper.ko`、`mi_kernel_monitor.ko`、`gpu_stats.ko`）的兼容性取决于 KMI 符号表，而 `android/abi_gki_aarch64_qcom` 在厂商树里、不在 GKI 树里 —— **需要上机验证**。另外「能编出 Image」不等于「能在小米 17 上启动」：AVB、vbmeta、厂商模块加载都还没验证过。
 
-1. 用 `make` 直接构建 `kernel_common` 并产出可启动的 `Image` —— **未实测**。
-2. 自编 GKI 内核对厂商模块（`dio_dma_mapper.ko`、`mi_kernel_monitor.ko`、`gpu_stats.ko`）的兼容性取决于 KMI 符号表，而 `android/abi_gki_aarch64_qcom` 在厂商树里、不在 GKI 树里 —— **需要验证**。
+- **`gki_defconfig` 里已经开好了这些**（这是全篇最有用的发现）：
+
+  | config | 值 |
+  | --- | --- |
+  | `CONFIG_ZRAM` | `m` |
+  | `CONFIG_ZRAM_MULTI_COMP` | `y` |
+  | `CONFIG_F2FS_FS_COMPRESSION` | `y` |
+  | `CONFIG_SCHED_CLASS_EXT` | `y` |
+  | `CONFIG_CFI_CLANG` | `y` |
+  | `CONFIG_MODVERSIONS` | `y` |
+  | `CONFIG_DEBUG_INFO_BTF` | `y` |
+  | `CONFIG_LTO_CLANG_THIN` | **defconfig 里没有**（由 AOSP 的 `build.config` 用 make 参数打开） |
+
+  → **zram 多算法、f2fs 压缩、sched_ext 这三件「功耗/压缩调优」的正事，GKI 默认配置里就直接支持**。先去调 sysfs，不要为了这些去改 config（见 `zram-compression-tuning`）。
+
+**为什么这是对的方向**：`BOARD_USES_GENERIC_KERNEL_IMAGE=true` 意味着设备启动的**本来就是 Google 的 GKI 内核**，厂商树里那个 Image 是被丢弃的。要改 zram / f2fs / 调度、要打 KernelSU，改 GKI 树就够，根本不需要那棵厂商树。
+
+**选哪个分支由设备的 `uname -r` 与 KMI 世代决定**——先跑 `xiaomi17-device-recon`，不要从网上推。小米 17 的 GKI 是 6.12（KMI 5 或 6 视 Android 版本）还是 6.18，**必须以实机为准**。
+
+**还没验证的一点**：自编 GKI 内核对厂商模块（`dio_dma_mapper.ko`、`mi_kernel_monitor.ko`、`gpu_stats.ko`）的兼容性取决于 KMI 符号表，而 `android/abi_gki_aarch64_qcom` 在厂商树里、不在 GKI 树里 —— **需要验证**。
 
 ### 闸门 4：构建系统与 defconfig 名
 

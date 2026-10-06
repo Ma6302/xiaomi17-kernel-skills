@@ -118,6 +118,20 @@ sudo apt-get install -y bc bison flex libssl-dev libelf-dev libdw-dev \
   make gcc tar xz-utils zip unzip cpio rsync python3 dwarves
 ```
 
+**第二个坑：发行版自带的 `pahole` 通常编不出可用的 BTF。** Ubuntu 24.04 是 `pahole 1.25`，它给 6.12 生成的 BTF 会被内核自带的 `resolve_btfids` 拒收：
+
+```
+FAILED: load BTF from vmlinux: Invalid argument
+make[3]: *** [/home/runner/kernel/scripts/Makefile.vmlinux:45: vmlinux] Error 255
+```
+
+**这不是「树不完整」——此时整棵树已经编到 `LD vmlinux` 了**，前面 30 分钟的编译一个错都没有。解法二选一：
+
+1. 用 AOSP 自己的 prebuilt pahole（正式构建走这条路）；
+2. smoke test 里退一步：`./scripts/config --file out/.config -d DEBUG_INFO_BTF` + `make olddefconfig` + 重跑 `make Image`。这只影响 `/sys/kernel/btf/vmlinux`（BPF CO-RE 用），不影响内核能否启动，而且因为目标文件都还在，重跑只要几分钟。
+
+推荐写成**自动降级**：第一次 `make` 失败后 `grep -q 'load BTF from vmlinux' build.log`，命中才关 BTF 重试，否则直接失败——不要让「关 BTF」掩盖掉真正的编译错误。
+
 ## GitHub Actions 的硬约束
 
 | 约束 | 数字 / 事实 | 对策 |
