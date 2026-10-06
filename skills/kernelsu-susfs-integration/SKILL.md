@@ -1,0 +1,120 @@
+---
+name: kernelsu-susfs-integration
+description: 用于把 KernelSU / KernelSU-Next 与 SUSFS 集成进自编译的 Android 内核，包括判断当前 root 方案、选择 KMI 对应的分支、打补丁链、配置 CONFIG_KSU 与 KSU_SUSFS 选项、验证是否生效，以及换 root 方案时的回退。当要获取隐藏 root、SUSFS 特性、或刷入内核后掉 root、模块失效时使用。
+---
+
+# KernelSU 与 SUSFS 集成
+
+## Overview
+
+先记住这一条，它决定了整个工作是否可行：
+
+> **SUSFS 是内核源码级补丁。纯 LKM 模式拿不到它。**
+> 要 SUSFS，就必须自编译内核并以 GKI 模式刷入。
+
+## When to Use
+
+- 要给自编译内核加上 KernelSU（含隐藏能力）。
+- 设备现在有 root，想知道换了内核之后会不会掉。
+- SUSFS 特性没生效、`ksu_susfs` 命令不存在、Momo/Holmes 仍能检测到。
+
+**何时不用**：内核还没编译成功（先去 `android-kernel-build-on-device`）；要刷入（去 `safe-kernel-flash`）。
+
+## 第零步（不能跳）：先确认现在是什么 root
+
+```bash
+bash scripts/detect-root.sh
+```
+
+它会报告：当前 root 管理器（Magisk / KernelSU / APatch）、是 LKM 还是 GKI 内置、`ksu_susfs` 是否在、已启用的 SUSFS 特性、已装模块列表、当前内核配置里相关项的值。
+
+**为什么这步不能跳**：刷入一个自带 KernelSU 的内核会**替换掉 boot 分区里现有的 root 方案**。如果现在是 Magisk（ramdisk 里打了 Magisk 补丁），刷完 = Magisk 补丁消失 = **掉 root**，已装模块可能全部失效。这是个可以预见、也可以先备份的后果，不该等到刷完才发现。
+
+**动手前必做**：备份当前 boot 分区（它里面就是你现在能用的 root）。这是唯一的退路。
+
+## 第一步：选对分支（KMI 必须匹配）
+
+| 设备 | Android | Linux | KMI |
+| --- | --- | --- | --- |
+| 小米 17 | Android 16 | 6.12.23 | KMI 5 |
+| 小米 17 | Android 17 | 6.12.69 | KMI 6 |
+
+- KernelSU-Next：用 `next` 分支。
+- SUSFS：用 `simonpunk/susfs4ksu` 的 **`gki-6.12`** 分支。
+
+**KMI 不匹配的后果**：厂商预编译模块拒绝加载（CRC/符号不匹配），表现为开机后 Wi-Fi、相机、快充等静默失效。
+
+## 第二步：补丁链（顺序错了会冲突）
+
+```
+1. KernelSU 目录准备
+   git clone <KernelSU-Next> KernelSU
+2. 把 10_enable_susfs_for_ksu.patch 打进 KernelSU 目录
+3. 把 50_add_susfs_in_gki-6.12.patch 打进内核根目录
+4. 拷 fs/* 与 include/linux/* 里的 SUSFS 新增文件
+```
+
+补丁文件名里的数字前缀是执行顺序。**先打 KernelSU 侧的，再打内核侧的**——反了会因为上下文不匹配而失败，而失败信息往往指向一个与被改文件无关的位置。
+
+## 第三步：配置项
+
+必须的：
+
+```
+CONFIG_KSU=y
+CONFIG_KPROBES=y
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+CONFIG_KSU_SUSFS_ENABLE_LOG=n        # 日志开着会暴露痕迹
+```
+
+用 `kernel-config-power-perf` 的 `safe-config-change.sh` 改，别手改 `.config`。
+
+**风险提醒**：KernelSU/SUSFS 会改动核心内核代码。若改动了导出符号，`Module.symvers` 的 CRC 会变，厂商预编译模块可能拒载。**每次改完都要验证厂商模块是否仍能加载**，这是验证项，不是可选项。
+
+## 第四步：验证（在真机上，不是看编译日志）
+
+```bash
+uname -r                                   # 确认跑的是自编译内核
+ksu_susfs show version                     # 命令不存在 = 内核没编进去
+ksu_susfs show enabled_features            # 逐项对照你开的 CONFIG
+su -c 'id'                                 # root 是否真的可用
+dmesg | grep -iE 'ksu|susfs|module.*(verif|version)' 
+```
+
+再用 Momo / Holmes 这类检测 App 看隐藏效果。
+
+**验证的最低标准**：`enabled_features` 的输出与你的 `CONFIG_KSU_SUSFS_*` 清单**逐项一致**。少一项就说明那个选项没编进去（多半是被 `olddefconfig` 掉了，因为它的依赖项没满足）。
+
+## 第五步：回退路径（在刷之前就写好）
+
+| 想回到 | 做法 |
+| --- | --- |
+| 原来的 root | 刷回你备份的原厂/原 root 的 boot 分区 |
+| 从 SUSFS 内核退回无 SUSFS | 刷上一个能开机的自编译内核 |
+| 完全干净 | 恢复 boot + init_boot 原厂镜像，然后卸载 `/data/adb/ksu` 相关残留 |
+
+`/data/adb` 下的状态（模块、隐藏列表、白名单）**在换 root 方案后不保证兼容**。切换前导出或记下配置。
+
+## Common Mistakes
+
+| 错误 | 后果 | 正确做法 |
+| --- | --- | --- |
+| 没确认当前 root 就刷 | 掉 root、模块全失效，且不知为何 | 先 `detect-root.sh`，先备份 boot |
+| 想用 LKM 拿 SUSFS | 拿不到，白折腾 | SUSFS 必须 GKI 内置 |
+| 分支 KMI 选错 | 厂商模块静默失效 | 按 Android 版本对 KMI |
+| 补丁顺序颠倒 | 上下文冲突，报错位置误导 | 先 KernelSU 侧，再内核侧 |
+| 只改 `.config` 就跑 | 依赖没满足的选项被 `olddefconfig` 静默关掉 | 改完比 `enabled_features` |
+| 开了 `KSU_SUSFS_ENABLE_LOG` | 日志本身成为痕迹 | 关掉 |
+| 认为刷上就完事 | 隐藏效果没验证 | Momo/Holmes + `enabled_features` 对照 |
+
+## Real-World Impact
+
+基线里 agent 的技术判断是对的：它正确指出 **SUSFS 无法通过 LKM 获得，必须 GKI 模式刷自编译内核**，也给出了补丁链与完整的 config 清单。但它**从头到尾没有确认用户当前用的是什么 root，也没有给任何卸载/回退路径**——在一个「刷内核」的场景里，这等于只给了油门没给刹车。它还引用了 XDA 上「小米 17 自编译 GKI 内核多例卡 bootloop，而 LKM 稳定」的说法，**这一条未经实机验证**，本仓库不把它当结论，只当作需要自己复现的线索。

@@ -1,0 +1,21 @@
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Scratch and build output — never commit these
+out/
+build/
+tmp/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Never commit device-identifying data
+device-profile.local.md
+*.serial

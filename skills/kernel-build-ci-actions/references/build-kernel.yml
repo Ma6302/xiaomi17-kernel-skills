@@ -1,0 +1,189 @@
+# 内核构建 workflow 模板（复制到 .github/workflows/build-kernel.yml）
+#
+# ⚠️ 先读这一段再决定要不要用这个模板：
+#   本模板走的是「多仓库 kernel_platform + Kleaf + build_with_bazel.py」这条路，
+#   需要你先拿到 manifest（MiCode 不提供，高通 CLO 需账号）。在拿到之前它编不起来。
+#
+#   **更简单的一条路**：直接 clone AOSP GKI 树 aosp-mirror/kernel_common@android16-6.12
+#   （实测 72,991 条路径、truncated:false，自带完整源码与顶层 Makefile，
+#   可以直接 make ARCH=arm64 LLVM=1 gki_defconfig && make -j）。
+#   设备启动的本来就是 GKI 内核（BOARD_USES_GENERIC_KERNEL_IMAGE=true），
+#   厂商树里的 Image 会被丢弃 —— 改功耗/压缩/调度、打 KernelSU，GKI 树就够。
+#   如果走那条路，把下面 job 里的 checkout/clone 段换成 kernel_common，
+#   构建段换成 make，其余（磁盘清理、缓存、Release、SHA256SUMS）照用。
+#   细节见 SKILL.md「备用方案一」。
+#
+# ⚠️ 使用前必须做的事：
+#   1. 先按 SKILL.md 第零步确认源码树是完整的（路径数万级，而不是几千级）。
+#   2. 改掉所有标了 "TODO 核实" 的地方 —— 那些是这台设备/这棵树的具体值，
+#      模板里给的值来自 2026-10 的一次实测，可能已经过期。
+#   3. workflow_dispatch 只认默认分支上已经存在的 workflow，
+#      所以第一次要先把它合进默认分支，再触发。
+#
+# 设计取舍（为什么这么写）：
+#   * fetch-depth: 1 —— 小米内核树有 1,260,958 个 commit，浅克隆是唯一可行解。
+#   * --disk_cache 而不是 ccache —— Kleaf 是 hermetic Bazel 构建，ccache 无效。
+#   * 缓存用 restore/save 分离 + if: always() —— 避免刷爆每仓库 10GB 配额。
+#   * 产物发 Release 而不是 artifact —— 手机端下载 artifact 要登录且域名被墙。
+#   * 产出 SHA256SUMS —— 经反代/镜像之后唯一能自证没被改的东西。
+
+name: build-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '构建 target（如 pudding / popsicle / pandora）'
+        required: true
+        default: 'pudding'          # TODO 核实：pudding = Xiaomi 17（以真机 getprop 为准）
+      variant:
+        description: 'variant（perf 或 consolidate）'
+        required: true
+        default: 'perf'
+      release_tag:
+        description: '发到哪个 Release tag'
+        required: false
+        default: 'kernel-latest'
+
+permissions:
+  contents: write      # 发 Release 需要
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # 托管 runner 单 job 硬上限就是 6 小时（360 分钟），larger runner 也一样。
+    # 设成 350 留出收尾时间；真正需要更久只能上 self-hosted。
+    timeout-minutes: 350
+
+    env:
+      # TODO 核实：这些分支/仓库名是 2026-10 的实测值
+      KERNEL_REPO: MiCode/Xiaomi_Kernel_OpenSource
+      KERNEL_BRANCH: popsicle-w-oss
+      DEVICETREE_REPO: MiCode/kernel_devicetree
+      BUILD_REPO: MiCode/kernel_build
+      BUILD_BRANCH: annibale-w-oss      # TODO 核实：MiCode/kernel_build 没有 popsicle 分支
+      WORKSPACE: ${{ github.workspace }}/kernel_platform
+
+    steps:
+      - name: 腾出磁盘
+        # 内核构建要 20-40GB，而 runner 只有约 14GB 可用。
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      - name: 准备 workspace 骨架（多仓库拼装）
+        # 这棵树不能单独构建：它引用父级 workspace 的 build/、soc-repo/、
+        # external/qcom-dtc/ 和 tools/bazel。缺任一个都会失败。
+        run: |
+          set -eux
+          mkdir -p "$WORKSPACE"
+          cd "$WORKSPACE"
+
+          # 1) 内核源码（稀疏树，放进 msm-kernel/）
+          git clone --depth 1 --branch "$KERNEL_BRANCH" \
+            "https://github.com/${KERNEL_REPO}.git" msm-kernel
+
+          # 2) Kleaf 构建系统 —— 提供 tools/bazel、build/kernel/kleaf/*
+          git clone --depth 1 --branch "$BUILD_BRANCH" \
+            "https://github.com/${BUILD_REPO}.git" build || \
+            echo "::warning::kernel_build 获取失败，构建几乎肯定无法进行"
+
+          # 3) 设备树
+          git clone --depth 1 --branch "$KERNEL_BRANCH" \
+            "https://github.com/${DEVICETREE_REPO}.git" msm-kernel-dt || true
+
+          # 4) TODO 核实：soc-repo 与 external/qcom-dtc 没有公开来源。
+          #    build.config.msm.popsicle 引用 soc-repo/build.config.msm.canoe，
+          #    bazel.WORKSPACE 引用 external/qcom-dtc。两者缺失时构建会在这里停住。
+          #    有 CLO（Codelinaro）账号后按 release-w-qcom-sm8850 manifest 同步，见下。
+          echo "::warning::soc-repo / external/dtc 需要 Qualcomm CLO 的 release-w-qcom-sm8850 manifest"
+
+      - name: 取得工具链
+        # 版本从 build.config.constants 读，不要写死。
+        run: |
+          set -eux
+          cd "$WORKSPACE/msm-kernel"
+          CLANG_VER="$(grep -E '^CLANG_VERSION=' build.config.constants | cut -d= -f2)"
+          echo "CLANG_VER=$CLANG_VER" >> "$GITHUB_ENV"
+          echo "从 build.config.constants 读到 CLANG_VERSION=$CLANG_VER"
+
+          mkdir -p "$WORKSPACE/prebuilts/clang/host/linux-x86"
+          cd "$WORKSPACE/prebuilts/clang/host/linux-x86"
+          # 用 gitiles 的目录归档一次性取，比 clone 快得多
+          curl -fsSL -o clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VER}.tar.gz"
+          mkdir -p "$CLANG_VER" && tar -xzf clang.tar.gz -C "$CLANG_VER"
+          rm -f clang.tar.gz
+
+      - name: 恢复 Bazel 缓存
+        # Kleaf 是 hermetic 构建，ccache 不起作用；要缓存的是 Bazel action cache。
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ env.WORKSPACE }}/bazel-cache
+            ${{ env.WORKSPACE }}/repository-cache
+          key: bazel-${{ env.KERNEL_BRANCH }}-${{ inputs.target }}-${{ inputs.variant }}-${{ github.run_id }}
+          restore-keys: |
+            bazel-${{ env.KERNEL_BRANCH }}-${{ inputs.target }}-${{ inputs.variant }}-
+
+      - name: 构建
+        # 注意：build_with_bazel.py 必须从 workspace 根目录运行，它会做
+        # workspace = 脚本目录/.. 的推导。默认产物目录是
+        # out/msm-kernel-<target>-<variant>。
+        run: |
+          set -eux
+          cd "$WORKSPACE"
+          python3 msm-kernel/build_with_bazel.py \
+            -t "${{ inputs.target }}" "${{ inputs.variant }}" \
+            --cache_dir "$WORKSPACE/bazel-cache" \
+            --log info
+
+      - name: 保存 Bazel 缓存
+        # save 放在 always() 里：构建失败时的部分缓存同样有价值。
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.WORKSPACE }}/bazel-cache
+            ${{ env.WORKSPACE }}/repository-cache
+          key: bazel-${{ env.KERNEL_BRANCH }}-${{ inputs.target }}-${{ inputs.variant }}-${{ github.run_id }}
+
+      - name: 收集产物并生成校验和
+        if: success()
+        run: |
+          set -eux
+          DIST="$WORKSPACE/out/msm-kernel-${{ inputs.target }}-${{ inputs.variant }}/dist"
+          mkdir -p release
+          if [ -d "$DIST" ]; then
+            cp -v "$DIST"/Image* "$DIST"/*.img "$DIST"/dtb* "$DIST"/System.map release/ 2>/dev/null || true
+            # .ko 与模块加载顺序必须一起带出来，否则刷完模块加载不上
+            [ -d "$DIST" ] && find "$DIST" -maxdepth 1 -name '*.ko' -exec cp -v {} release/ \; || true
+            for f in modules.load modules.dep modules.alias modules.softdep vendor_dlkm.modules.load; do
+              [ -f "$DIST/$f" ] && cp -v "$DIST/$f" release/ || true
+            done
+            [ -f "$DIST/.config" ] && cp -v "$DIST/.config" release/kernel.config || true
+          fi
+          ls -la release/
+          # SHA256SUMS 是经过反代/镜像之后唯一能自证产物完整的东西
+          ( cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS )
+
+      - name: 发布到 Release
+        # 用 Release asset 而不是 artifact：artifact 下载需要登录，
+        # 而且和 raw/objects.githubusercontent.com 一样在国内常被墙。
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: "kernel ${{ inputs.target }}-${{ inputs.variant }} (${{ github.run_number }})"
+          body: |
+            由 GitHub Actions 构建。
+
+            核实方式：下载后先比 `SHA256SUMS`，再按 `safe-kernel-flash` 的清单刷入。
+            构建目标：`${{ inputs.target }}-${{ inputs.variant }}`
+          files: release/*
+          make_latest: false
