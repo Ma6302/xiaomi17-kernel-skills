@@ -92,14 +92,26 @@ jobs:
       - name: 下载 AOSP prebuilt clang
         run: |
           set -eux
+          set -o pipefail
           CLANG_VER='${{ inputs.clang_version }}'
-          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VER}.tar.gz"
-          mkdir -p "$HOME/toolchain/clang-${CLANG_VER}"
-          # gitiles 的 +archive 返回的是目录内容的 tar.gz（不含顶层目录名）
-          curl -fsSL --retry 3 "$URL" \
-            | tar -xzf - -C "$HOME/toolchain/clang-${CLANG_VER}"
-          echo "$HOME/toolchain/clang-${CLANG_VER}/bin" >> "$GITHUB_PATH"
-          "$HOME/toolchain/clang-${CLANG_VER}/bin/clang" --version
+          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
+
+          # 先确认目录存在。坑：build.config.constants 里的值是 r536225，
+          # 但仓库里的目录名是 clang-r536225 —— 归档 URL 必须带 clang- 前缀，
+          # 写成 r536225.tar.gz 会得到 HTTP 400，且报错完全看不出原因。
+          echo "--- 可用的 clang 目录 ---"
+          curl -fsSL "$BASE/+/refs/heads/main/?format=JSON" \
+            | sed '1s/^)]}.//' \
+            | grep -oE '"name": "clang-r[0-9]+"' | sort -u
+
+          CLANG_DIR="clang-${CLANG_VER}"
+          curl -fsSL --retry 3 -o /tmp/clang.tar.gz \
+            "$BASE/+archive/refs/heads/main/${CLANG_DIR}.tar.gz"
+          mkdir -p "$HOME/toolchain/${CLANG_DIR}"
+          tar -xzf /tmp/clang.tar.gz -C "$HOME/toolchain/${CLANG_DIR}"
+          rm -f /tmp/clang.tar.gz
+          echo "$HOME/toolchain/${CLANG_DIR}/bin" >> "$GITHUB_PATH"
+          "$HOME/toolchain/${CLANG_DIR}/bin/clang" --version
 
       # -------------------------------------------------------------- 构建
       - name: make gki_defconfig

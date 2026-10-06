@@ -114,10 +114,16 @@ jobs:
 
           mkdir -p "$WORKSPACE/prebuilts/clang/host/linux-x86"
           cd "$WORKSPACE/prebuilts/clang/host/linux-x86"
-          # 用 gitiles 的目录归档一次性取，比 clone 快得多
+          # 用 gitiles 的目录归档一次性取，比 clone 快得多。
+          # ⚠️ 坑：build.config.constants 里的值是 r536225，但仓库里的**目录名**是 clang-r536225，
+          #    归档 URL 与本地解压目录都必须带 clang- 前缀。
+          #    写成 ${CLANG_VER}.tar.gz 会得到 HTTP 400，报错信息完全看不出原因。
+          #    先用 gitiles 的 JSON 列表确认目录存在，再下载：
+          #      curl -fsSL 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/refs/heads/main/?format=JSON'
+          CLANG_DIR="clang-${CLANG_VER}"
           curl -fsSL -o clang.tar.gz \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VER}.tar.gz"
-          mkdir -p "$CLANG_VER" && tar -xzf clang.tar.gz -C "$CLANG_VER"
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_DIR}.tar.gz"
+          mkdir -p "$CLANG_DIR" && tar -xzf clang.tar.gz -C "$CLANG_DIR"
           rm -f clang.tar.gz
 
       - name: 恢复 Bazel 缓存

@@ -90,6 +90,21 @@ python3 <kernel_dir>/build_with_bazel.py -t <target> <variant>
 
 工具链版本**从 `build.config.constants` 读，不要写死**：`CLANG_VERSION=r536225`（= clang 19.0.1，2024-11）、`AARCH64_NDK_TRIPLE=aarch64-linux-android31`。`build.config.common` 用 **`LLVM=1`** 驱动全部工具选择（不是手写 CC/LD/AR 一长串）。
 
+**取工具链时的一个坑（实测踩过）**：`build.config.constants` 里的值是 `r536225`，但 AOSP 仓库里的**目录名**是 `clang-r536225`。gitiles 归档 URL 必须写
+
+```
+https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r536225.tar.gz
+```
+
+写成 `.../r536225.tar.gz` 会返回 **HTTP 400**——注意是 400 不是 404，报错信息里没有任何线索指向「少了 clang- 前缀」。本地解压出来的目录也必须叫 `clang-r536225`，因为 `build.config.common` 找的是 `prebuilts/clang/host/linux-x86/clang-${CLANG_VERSION}/bin`。
+
+先列目录再下载，可以省掉这一轮试错：
+
+```bash
+curl -fsSL 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/refs/heads/main/?format=JSON' \
+  | sed '1s/^)]}.'"'"'//' | grep -oE '"name": "clang-r[0-9]+"' | sort -u
+```
+
 ## GitHub Actions 的硬约束
 
 | 约束 | 数字 / 事实 | 对策 |
