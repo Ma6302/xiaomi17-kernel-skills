@@ -1,6 +1,6 @@
 ---
 name: safe-kernel-flash
-description: 用于在 Android 手机上安全刷入自编译内核并保留可回滚路径，包括刷前检查、备份原厂 boot 分区、在机内用 dd 直接写入或用 fastboot 写入、判断是否需要动 vbmeta、以及刷不开机时的恢复阶梯。当要刷写内核镜像或 AnyKernel3 包、需要回滚到原厂内核、或刷完无法开机时使用。
+description: 用于在 Android 手机上安全刷入自编译内核并保留可回滚路径，包括刷前检查、备份 root 补丁所在的分区（GKI 设备上常是 init_boot 而不是 boot）、在机内用 dd 直接写入或用 fastboot 写入、判断是否需要动 vbmeta、以及刷不开机时的恢复阶梯。当要刷写内核镜像或 AnyKernel3 包、需要回滚到原厂内核、或刷完无法开机时使用。
 ---
 
 # 安全刷入内核
@@ -36,11 +36,12 @@ bash scripts/preflight-flash.sh --zip /sdcard/Download/Operit/kernel-dev/out/xxx
 bash ../xiaomi17-device-recon/scripts/collect-device-facts.sh --backup
 ```
 
-备份必须满足三条，缺一条就等于没有备份：
+备份必须满足**四条**，缺一条就等于没有备份：
 
-1. **落在机外**（电脑、U 盘、云盘）。存在同一个 /data 里，设备一旦进不了系统你取不出来。
-2. **有 SHA256 并且校验通过**。一个静默损坏的备份和被刷坏的设备一样无可挽回。
-3. **包含 vbmeta**。忘了它，后面想动 verity 时就没有退路。
+1. **包含 root 补丁所在的那个分区。** `device-profile.md` 里的 `ROOT_PARTITION` 就是答案 —— 在 GKI 设备上它常常是 `init_boot` 而不是 `boot`（内核在 `boot`，通用 ramdisk 在 `init_boot`）。**只备份 `boot` 而 root 在 `init_boot`，是最常见的假备份**：开机时看着有备份，真出事时发现里面没有你唯一想要的东西。
+2. **落在机外**（电脑、U 盘、云盘）。存在同一个 /data 里，设备一旦进不了系统你取不出来。
+3. **有 SHA256 并且校验通过**。一个静默损坏的备份和被刷坏的设备一样无可挽回。
+4. **包含 vbmeta**。忘了它，后面想动 verity 时就没有退路。
 
 ## 第三步：理解 ARB 到底管什么
 

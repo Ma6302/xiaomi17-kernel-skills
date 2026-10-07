@@ -76,6 +76,38 @@ for name in boot init_boot vendor_boot dtbo vbmeta recovery super; do
 	printf '%s\n' "$blockdev" | grep -qx "$name" 2>/dev/null && eval "has_$name=1"
 done
 
+# --- 现有 root 方案 ------------------------------------------------------------
+# 这不是"顺便看看"。刷入自编内核会换掉 root 所在的那个分区，而**是哪个分区，在
+# GKI 设备上和你以为的不一样**：内核在 boot，通用 ramdisk 在 init_boot。KernelSU
+# 的 LKM 模式把模块补丁打进 ramdisk，所以补丁多半在 init_boot —— 只备份 boot
+# 等于没有退路。这里全部是只读判断，不写任何分区、不改任何 prop。
+root_mode="none"
+if command -v magisk >/dev/null 2>&1 || [ -d /data/adb/magisk ]; then
+	root_mode="magisk"
+fi
+if command -v ksud >/dev/null 2>&1 || [ -d /data/adb/ksu ]; then
+	root_mode="kernelsu-lkm"
+	run "zcat /proc/config.gz" | grep -q '^CONFIG_KSU=y' && root_mode="kernelsu-gki"
+fi
+[ "$root_mode" = "none" ] && command -v apd >/dev/null 2>&1 && root_mode="apatch"
+# 有 su 但认不出管理器时不要谎报 none —— "未知"和"没有"是两件事。
+[ "$root_mode" = "none" ] && command -v su >/dev/null 2>&1 && root_mode="manager-unknown"
+
+# 补丁落在哪个分区：GKI 布局下内核在 boot、通用 ramdisk 在 init_boot。
+# 只有管理器界面显示的"修补目标"才是权威答案，这里给的是最可能的推断。
+root_partition="$UNKNOWN"
+case "$root_mode" in
+	kernelsu-gki) root_partition="boot" ;;
+	kernelsu-lkm|magisk|apatch)
+		if [ "$has_init_boot" = "1" ]; then
+			root_partition="init_boot(推断；以管理器安装页的修补目标为准)"
+		else
+			root_partition="boot(推断；设备无 init_boot 分区)"
+		fi
+		;;
+	none) root_partition="none" ;;
+esac
+
 [ -n "$p_device" ]  || p_device="$UNKNOWN"
 [ -n "$p_slot" ]    || p_slot="(无，可能非 A/B)"
 [ -n "$krel" ]      || krel="$UNKNOWN"
@@ -131,6 +163,8 @@ VERIFIED_BOOT_STATE=$p_vbstate
 FLASH_LOCKED=$p_locked
 VERITY_MODE=$p_verity
 ANTI_ROLLBACK_INDEX=$p_anti
+ROOT_MODE=$root_mode
+ROOT_PARTITION=$root_partition
 VENDOR_API_LEVEL=$p_api
 HAS_BOOT=$has_boot
 HAS_INIT_BOOT=$has_init_boot
@@ -165,7 +199,31 @@ EOF
 	echo "| BL 锁定 | \`$p_locked\`（1=锁，0=已解锁） | \`ro.boot.flash.locked\` |"
 	echo "| verity 模式 | \`$p_verity\` | \`ro.boot.veritymode\` |"
 	echo "| ARB 指数 | \`${p_anti:-$UNKNOWN}\` | \`ro.boot.anti\`（常为空，见下） |"
+	echo "| 现有 root | \`$root_mode\` | \`/data/adb\`、\`su -v\`、\`ksud\`、\`/proc/config.gz\` |"
+	echo "| root 补丁所在分区 | \`$root_partition\` | 分区存在性 + 管理器修补目标 |"
 	echo "| vendor API level | \`$p_api\` | \`ro.vendor.api_level\` |"
+	echo
+	echo "## 现有 root 方案"
+	echo
+	if [ "$root_mode" = "none" ]; then
+		echo "没有检测到已知的 root 管理器。这可能意味着**确实没有 root**，也可能意味着"
+		echo "root 方案不在脚本认识的路径里。**这两件事不是一回事**，别混为一谈。"
+		echo
+		echo "- 确实没有 root → 没有 patch 型 root，不需要备份 root 分区。"
+		echo "- 只是没认出来 → 先确认清楚再往下走。刷自编内核会换掉 root 所在的那个分区。"
+	else
+		echo "检测到：\`$root_mode\`。**刷自编内核之前，要备份的是 \`$root_partition\` —— 不是想当然的 \`boot\`。**"
+		echo
+		echo "GKI 设备上内核在 \`boot\`、通用 ramdisk 在 \`init_boot\`。KernelSU 的 LKM 模式把"
+		echo "\`kernelsu.ko\` 的补丁打进 ramdisk，所以补丁在 \`init_boot\`；刷一个新的 \`boot.img\`"
+		echo "**不会**抹掉它 —— 会不会掉 root，取决于新内核的 KMI / 模块校验是否还让那个 \`.ko\` 加载。"
+		echo "这一条必须实测，不能推。"
+		echo
+		echo "权威答案在 KernelSU / Magisk 管理器的\"安装\"（修补）页面：它写明正在修补哪个镜像。"
+		echo "脚本给的 \`$root_partition\` 只是推断，界面才是事实。"
+		echo
+		echo "LKM 模式还意味着：**SUSFS 拿不到**（它是内核源码级补丁，必须自编译内核走 GKI 模式）。"
+	fi
 	echo
 	echo "## 分区布局"
 	echo

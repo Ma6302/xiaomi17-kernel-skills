@@ -28,9 +28,24 @@ bash scripts/detect-root.sh
 
 它会报告：当前 root 管理器（Magisk / KernelSU / APatch）、是 LKM 还是 GKI 内置、`ksu_susfs` 是否在、已启用的 SUSFS 特性、已装模块列表、当前内核配置里相关项的值。
 
-**为什么这步不能跳**：刷入一个自带 KernelSU 的内核会**替换掉 boot 分区里现有的 root 方案**。如果现在是 Magisk（ramdisk 里打了 Magisk 补丁），刷完 = Magisk 补丁消失 = **掉 root**，已装模块可能全部失效。这是个可以预见、也可以先备份的后果，不该等到刷完才发现。
+**为什么这步不能跳**：刷入自编内核会**替换掉 root 所在的那个分区**。但 **是哪个分区，在 GKI 设备上和你以为的不一样**：
 
-**动手前必做**：备份当前 boot 分区（它里面就是你现在能用的 root）。这是唯一的退路。
+| 现在的 root | root 补丁在哪 | 刷自编 `boot.img` 之后 |
+| --- | --- | --- |
+| KernelSU **LKM**（管理器修补镜像） | GKI 设备上是 **`init_boot`**（内核在 `boot`，通用 ramdisk 在 `init_boot`） | `boot` 被换掉，`init_boot` 里的补丁**还在** → 掉不掉 root 取决于新内核的 KMI / 模块校验还能不能加载那个 `.ko`。**必须实测，不能推** |
+| KernelSU **GKI 内置** | `boot`（内核镜像自带 `CONFIG_KSU=y`） | 直接换掉；带不带 KSU 由你编译时决定 |
+| Magisk | 有 ramdisk 的老设备在 `boot`；GKI 设备在 **`init_boot`** | 补丁消失 = **掉 root**，模块可能全部失效 |
+| APatch | `boot` | 补丁消失 = 掉 root |
+
+**动手前必做两件事**：① 确认 root 补丁到底在哪个分区（管理器的"安装/修补"页面会写明正在修补哪个镜像，那才是事实；下面是辅助判断）；② 把**那个分区**备份出来并拷到机外 —— 只备份 `boot` 而补丁在 `init_boot`，等于没有退路。
+
+```bash
+su -c 'lsmod | grep -i kernelsu'                            # 有输出 = LKM（模块在跑）
+ls -l /data/adb/ksu /data/adb/ksud /data/adb/magisk 2>/dev/null
+zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_KSU='   # =y 且 lsmod 里没有 → GKI 内置
+```
+
+**反过来也要注意**：如果你从 LKM 改走 GKI 内置，`init_boot` 里那个 LKM 补丁就成了多余的，两套 KSU 同时存在会互相打架 —— 这种情况要恢复原厂 `init_boot`。`xiaomi17-device-recon` 的 `ROOT_MODE` / `ROOT_PARTITION` 两个字段就是为这件事采集的。
 
 ## 第一步：选对分支（KMI 必须匹配）
 

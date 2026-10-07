@@ -35,7 +35,11 @@ description: 用于在小米 17（SM8850 / 骁龙 8 Elite Gen 5）或任何 A/B 
 | `SLOT` | `getprop ro.boot.slot_suffix` | 只刷当前活动槽，是唯一的回退保险 |
 | `FLASH_LOCKED` | `getprop ro.boot.flash.locked` | 0 才可能刷写；锁着刷自制镜像＝硬砖 |
 | `VERITY_MODE` | `getprop ro.boot.veritymode` | 决定是否要动 vbmeta |
+| `ROOT_MODE` | `/data/adb/{magisk,ksu}`、`su -v`、`ksud -V`、`lsmod \| grep -i kernelsu`；`/proc/config.gz` 里 `CONFIG_KSU=y` 且 `lsmod` 无 → GKI 内置 | 决定刷自编内核之后会不会掉 root；LKM 模式拿不到 SUSFS。没有 root 就写 `none` |
+| `ROOT_PARTITION` | 管理器的"安装/修补"页面写着在修补哪个镜像；没有 `init_boot` 分区的设备必然在 `boot` | **它才是刷前的"唯一退路"。**备份错分区等于没备份。没有 root 就写 `none` |
 | `ANTI_ROLLBACK_INDEX` | `ro.boot.anti`，空则 `fastboot getvar anti` | ARB 不可逆，推高就再也回不去 |
+
+`ROOT_MODE` / `ROOT_PARTITION` 的值可以是 `none`（确实没有 root），但**不能是 UNKNOWN** —— 分不清"没有 root"和"不知道有没有 root"，是刷机事故的常见起点。在 GKI 布局里内核在 `boot`、通用 ramdisk 在 `init_boot`，所以 KernelSU 的 LKM 补丁通常在 `init_boot`：**只备份 `boot` 是最容易犯的错。**
 
 其余记录项（型号、SoC、Android 版本、安全补丁、ROM 版本、分区清单、关键分区存在性、`ro.boot.verifiedbootstate`、`ro.vendor.api_level`）是为后续步骤提供上下文，缺失只记 UNKNOWN。
 
@@ -67,6 +71,9 @@ fastboot getvar anti                # 空值就写 UNKNOWN，并当作高危
 | BL 状态 | `getprop ro.boot.flash.locked`（0=解锁） |
 | 验证启动 | `getprop ro.boot.verifiedbootstate`（green/orange/yellow） |
 | verity | `getprop ro.boot.veritymode`（enforcing/disabled） |
+| 现有 root | `ls /data/adb/{magisk,ksu}`、`su -v`、`ksud -V` |
+| LKM 还是 GKI 内置 | `su -c 'lsmod \| grep -i kernelsu'`；`zcat /proc/config.gz \| grep '^CONFIG_KSU='` |
+| root 补丁在哪个分区 | 管理器「安装/修补」页写的目标镜像（权威）；`ls /dev/block/by-name` 看有无 `init_boot` |
 | 分区清单 | `ls /dev/block/by-name` |
 | 分区实际挂点 | `readlink -f /dev/block/by-name/boot_a` |
 | ARB | `fastboot getvar anti` |
@@ -88,6 +95,8 @@ fastboot getvar anti                # 空值就写 UNKNOWN，并当作高危
 | 备份留在手机上 | 手机开不了机时备份也拿不出来 | `--backup` 后必须拷到电脑 + 云盘 |
 | 把 `device-profile.md` 提交进仓库 | 泄露设备标识 | 它在运行时目录，`.gitignore` 已覆盖 `device-profile.local.md` |
 | 字段 UNKNOWN 就继续 | 后面每一步都在猜，错到刷机才暴露 | 脚本 exit 3 就是 BLOCKED |
+| 只备份 `boot`，而 root 补丁其实在 `init_boot` | 以为有退路，真出事时备份里根本没有 root | 先确认 `ROOT_PARTITION`，备份补丁所在的那个分区 |
+| 把「没有 root」和「不知道有没有 root」混为一谈 | 该备份的没备份，或该停下的继续走 | `ROOT_MODE` 只能是 `none` 或具体方案，不能是 UNKNOWN |
 
 ## Red flags
 
@@ -97,6 +106,8 @@ fastboot getvar anti                # 空值就写 UNKNOWN，并当作高危
 - `KMI_GENERATION` 是空的或 `UNKNOWN`。
 - 说了「A/B 设备」却不知道当前是 a 还是 b。
 - 不知道 ARB 指数，却已经打算「不行就刷回旧版」。
+- 不知道 root 补丁在 `boot` 还是 `init_boot`，却已经打算刷自编内核。
+- 准备用「刷回原厂 `boot`」来恢复 root，但 root 其实在 `init_boot` —— 刷了也不管用。
 
 ## 产出示例
 
