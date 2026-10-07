@@ -62,3 +62,84 @@ bash scripts/validate-skills.sh
 A skill that fails validation is silently ignored by the agent runtime, which
 is a failure mode that looks like "the agent ignored my instructions" rather
 than "the file is broken".
+
+## Who may change what
+
+This repository is edited by **two different agents**: a desktop agent (the
+author) and an on-device agent running on the phone (the target environment).
+They have different capabilities, so they have different write rights.
+
+| | Desktop agent | On-device agent |
+| --- | --- | --- |
+| Edit `skills/**` | yes | **no** |
+| Edit `scripts/**`, docs, workflows | yes | yes, via PR |
+| Primary job | author the method, reason about it | run things on the real device, report raw evidence |
+
+**The on-device agent must not edit `skills/`.** These skills are that agent's
+own safety rails, and an agent that can rewrite its safety rails does not have
+any. If a skill is wrong, the on-device agent reports the *observation* —
+command, output, device state — and the desktop agent turns it into a skill
+change. "I fixed the wording" is not a valid on-device contribution.
+
+### Evidence rule
+
+Any device-measured fact that enters a skill body, `README.md` or a commit
+message must carry **all three** of:
+
+1. the raw evidence (log file, command output, `device-profile.md` values),
+2. the date,
+3. the device state (build version, `uname -r`, root method).
+
+A claim missing any of the three is written as **UNVERIFIED**, in those words.
+Device facts are snapshots — an OTA invalidates them. They belong in the
+runtime `device-profile.md`, never as a constant inside a skill body.
+
+### Never
+
+- `git push --force` / `--force-with-lease`, rebasing pushed history, or any
+  other rewrite. `main` is append-only.
+- `--no-verify`, or deleting branches.
+- Committing device identifiers (serial, IMEI, account names, tokens, personal
+  paths), kernel source trees, or build output (`out/`, `*.img`, `*.ko`).
+- Writing an unverified claim in the voice of a measured one.
+
+### Commit provenance
+
+Prefix every commit subject with where the knowledge came from:
+
+```
+[desktop] <what was decided or written>
+[phone]   <what was observed on the device>
+[ci]      <what a build or test run produced>
+```
+
+A `[phone]` or `[ci]` commit is **evidence**; a `[desktop]` commit is
+**interpretation**. When the two disagree, the evidence wins — including when
+it contradicts a rule above. Report the contradiction rather than quietly
+following the stale rule.
+
+### Enforce it in settings, not only in prose
+
+Prose does not bind an agent that ignores it. On GitHub, protect `main`:
+require a pull request, disable force pushes, disable branch deletion. If the
+phone authenticates with a personal access token, use a **fine-grained** token
+limited to these repositories with `Contents` + `Actions` + `Pull requests`
+write access — never a classic `repo`-scoped token, and never grant
+`Administration`.
+
+## Where the kernel project lives
+
+**Not in this repository.** This one is MIT and deliberately ships no upstream
+code. The kernel project — KernelSU/SUSFS patches, `zram-ir`, config
+fragments, build scripts, boot images — is GPL-2.0 by derivation, so it belongs
+in a **separate repository**. Keep the licence boundary and the repository
+boundary in the same place.
+
+That repository should be a **patch stack, not a fork**: no kernel source, only
+`patches/` + `config/` + `scripts/` + CI that clones upstream `kernel_common`
+at a pinned ref and applies the patches. That keeps it small enough to clone on
+the phone, and makes every build reproducible from a pinned upstream ref.
+
+The only kernel artefacts that stay *here* are workflows whose purpose is to be
+**reproducible evidence for a claim made in a skill** — see
+`.github/workflows/gki-build-check.yml`.
