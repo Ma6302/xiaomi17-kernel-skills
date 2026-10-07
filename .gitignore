@@ -19,3 +19,7 @@ __pycache__/
 # Never commit device-identifying data
 device-profile.local.md
 *.serial
+
+# Scratch files used while preparing a commit
+_commitmsg.txt
+_*.json
