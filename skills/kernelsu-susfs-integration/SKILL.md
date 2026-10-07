@@ -62,6 +62,11 @@ bash scripts/detect-root.sh
 
 补丁文件名里的数字前缀是执行顺序。**先打 KernelSU 侧的，再打内核侧的**——反了会因为上下文不匹配而失败，而失败信息往往指向一个与被改文件无关的位置。
 
+> **搬上游代码前先看许可证——这一步不能跳。**
+> `tiann/KernelSU` 的 GitHub 识别结果是 GPL-3.0，而它的 README 原文写明：**只有 `kernel/` 目录是 GPL-2.0-only**，除该目录外其余是 GPL-3.0-or-later。`simonpunk/susfs4ksu` 的 `LICENSE` 则是 **GPLv3 全文**，没有 "only" / "or later" 限定词（且托管在 GitLab，GitHub 上的同名地址是 404）。
+> 内核整体是 GPL-2.0 **only**；kernel.org 列出的兼容集（GPL-1.0+、GPL-2.0+、LGPL-2.0、LGPL-2.0+、LGPL-2.1、LGPL-2.1+）里 **没有 GPL-3.0**。
+> 所以：**只把明确是 GPL-2.0-only 的文件搬进内核树**，含糊的先查清再搬。完整处置办法见 `kernel-project-repo-bootstrap` 第一步。
+
 ## 第三步：配置项
 
 必须的：
@@ -120,6 +125,7 @@ dmesg | grep -iE 'ksu|susfs|module.*(verif|version)'
 | 只改 `.config` 就跑 | 依赖没满足的选项被 `olddefconfig` 静默关掉 | 改完比 `enabled_features` |
 | 开了 `KSU_SUSFS_ENABLE_LOG` | 日志本身成为痕迹 | 关掉 |
 | 认为刷上就完事 | 隐藏效果没验证 | Momo/Holmes + `enabled_features` 对照 |
+| 把 KernelSU 整个仓库的代码搬进内核树 | KernelSU 只有 `kernel/` 是 GPL-2.0-only，其余是 GPL-3.0-or-later，混进 GPL-2.0-only 内核是真实冲突 | 只搬 `kernel/` 目录下的文件；许可证细节见 `kernel-project-repo-bootstrap` |
 
 ## Real-World Impact
 

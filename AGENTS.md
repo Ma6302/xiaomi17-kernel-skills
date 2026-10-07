@@ -143,3 +143,8 @@ the phone, and makes every build reproducible from a pinned upstream ref.
 The only kernel artefacts that stay *here* are workflows whose purpose is to be
 **reproducible evidence for a claim made in a skill** — see
 `.github/workflows/gki-build-check.yml`.
+
+Creating that repository is itself a procedure: see the
+`kernel-project-repo-bootstrap` skill. Note its central caveat — a branch
+ruleset only blocks `git push`, and a token with `Administration` can delete the
+ruleset itself, so the guardrail is only as strong as the token's permissions.

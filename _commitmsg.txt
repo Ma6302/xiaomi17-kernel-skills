@@ -1,0 +1,40 @@
+[desktop] Add kernel-project-repo-bootstrap; correct licensing and git pinning
+
+New skill (10th): how to stand up the kernel project repo as a separate,
+GPL-2.0-only patch stack instead of a fork of kernel_common.
+
+Corrections that came out of primary-source research:
+
+- Licensing landmine: KernelSU is GPL-3.0 overall; only its kernel/
+  directory is GPL-2.0-only. susfs4ksu's LICENSE is the full GPLv3 text
+  with no only/or-later qualifier. kernel.org license-rules (fetched
+  2026-10-07) states the kernel is GPL-2.0 only and lists the compatible
+  set as GPL-1.0+/GPL-2.0+/LGPL-2.0/LGPL-2.0+/LGPL-2.1/LGPL-2.1+ --
+  GPL-3.0 is not in it. Added the same warning to
+  kernelsu-susfs-integration, which is the skill that actually tells the
+  agent to copy those files into the kernel tree.
+
+- git: git has no fuzz factor; `git am -3`/`git apply -3` needs the
+  pre-image blobs locally and therefore cannot be paired with
+  `--depth 1 --filter=blob:none` (error: repository lacks the necessary
+  blob to perform 3-way merge). Prefer `git quiltimport`. `git clone
+  --revision` exists but needs git >= 2.49 (Ubuntu 24.04 ships 2.43).
+  Pin commit SHAs, not branch names.
+
+- Patches carry DEP-3 Origin + Yocto Upstream-Status + original
+  Signed-off-by/Change-Id; there is no patches.json standard.
+
+- Rulesets: require_last_push_approval is what stops one identity from
+  opening, approving and merging its own PR. Pushing files under
+  .github/workflows/ needs a separate Workflows: write grant. Creating
+  or deleting a repo ruleset needs Administration: write, so a token
+  holding it can remove the lock -- org-level rulesets are the only
+  version a single-repo token cannot touch.
+
+Verified locally (2026-10-07):
+  ls-remote --tags aosp-mirror/kernel_common -> 9372 refs
+  android16-6.12.52_r00 -> 36e5f6313583daf75ec31104ee8a186798a3b95f
+  android16-6.12.45_r00 -> ae6d0451fe00a4590b8cfafdb0cefb5fc4102824
+  android16-6.12-2025-09_r9 -> f2f676a2f21637b39f7f2be2f6137c1d9570d3e7
+
+validate-skills.sh: checked=10 failing=0 warning=0

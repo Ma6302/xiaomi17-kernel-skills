@@ -6,7 +6,7 @@
 
 ## 为什么存在
 
-实测了 9 个场景下「没有 skill 的 agent」的行为。它自信、细节丰富、多数流程正确，但在几个地方**知道得不够精确**，而那些地方恰好都是变砖级或时间级代价：
+实测了 10 个场景下「没有 skill 的 agent」的行为。它自信、细节丰富、多数流程正确，但在几个地方**知道得不够精确**，而那些地方恰好都是变砖级或时间级代价：
 
 | 场景 | 没有 skill 时的典型行为 |
 | --- | --- |
@@ -19,8 +19,9 @@
 | zram | 引用 Linux 7.3-rc6 的文档去配一台 6.12 的设备（`algorithm_params` 在 6.12 上不存在） |
 | 验证 | 把 2% 的噪声当成功效（该基线自己承认了这一点，值得肯定） |
 | CI | 断言源码树「可以直接构建」（后来被独立核实推翻） |
+| 建仓 | 许可证与 patch-stack 形状都选对了，但推荐了一个实测会失败的 fetch 组合，并把「`--depth 1` 检不出任意 SHA」当成事实（已实测推翻）；同时默认「内核补丁都是 GPL-2.0」——而 KernelSU 只有 `kernel/` 是 GPL-2.0-only，`susfs4ksu` 的 LICENSE 是 GPLv3 全文 |
 
-## 九个 skill
+## 十个 skill
 
 | skill | 解决什么 |
 | --- | --- |
@@ -33,6 +34,7 @@
 | [`kernelsu-susfs-integration`](skills/kernelsu-susfs-integration/SKILL.md) | 先搞清当前 root，再打补丁链；SUSFS 必须 GKI 内置 |
 | [`kernel-build-ci-actions`](skills/kernel-build-ci-actions/SKILL.md) | 云端构建、缓存策略、中国大陆触发与下载 |
 | [`kernel-perf-verification`](skills/kernel-perf-verification/SKILL.md) | 用比值与置信区间判断「是不是真的更好」；`\|Δ\| < 2×CV` 就认输 |
+| [`kernel-project-repo-bootstrap`](skills/kernel-project-repo-bootstrap/SKILL.md) | 内核工程另建仓：GPL-2.0 边界与 GPL-3.0 地雷、patch stack 而非 fork、补丁来源头、pin 死 SHA、`quiltimport`、ruleset 上锁的极限 |
 
 ## 部署到手机
 
@@ -138,7 +140,7 @@ make -s kernelrelease = 6.12.52-4k-g105b5745f1d7
 - 该树 `gki_defconfig` 中 `ZRAM=m`、`ZRAM_MULTI_COMP=y`、`F2FS_FS_COMPRESSION=y`、`SCHED_CLASS_EXT=y`、`CFI_CLANG=y`、`MODVERSIONS=y`、`DEBUG_INFO_BTF=y`（数值取自 CI 实跑日志）
 - `MiCode/Xiaomi_Kernel_OpenSource@popsicle-w-oss` 只有 2,686 条路径、缺 `kernel/sched/fair.c` 等核心文件、无 `build/`、无 `tools/bazel`、无 `arch/arm64/configs/*_defconfig` —— **不能单独构建**
 - 代号 `pudding`=小米 17 / `pandora`=17 Pro / `popsicle`=17 Pro Max，同平台 `canoe`（来自 MiCode issue #40786 等，仍以实机 `getprop` 为准）
-- `scripts/validate-skills.sh` 与 `scripts/install-to-operit.sh` 的行为（9 个 skill 全绿；安装幂等；格式错误会拒绝）
+- `scripts/validate-skills.sh` 与 `scripts/install-to-operit.sh` 的行为（10 个 skill 全绿；安装幂等；格式错误会拒绝）
 
 ## 未核实清单（诚实记录）
 
