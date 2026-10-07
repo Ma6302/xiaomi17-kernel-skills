@@ -56,7 +56,15 @@ zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_KSU='   # =y 且 lsmod 里�
 | 小米 17 | Android 16 | 6.12.23 | KMI 5 |
 | 小米 17 | Android 17 | 6.12.69 | KMI 6 |
 
-判断依据只能从设备上取：`uname -r`（Linux 版本）+ `getprop ro.build.version.release`（Android 版本）+ `xiaomi17-device-recon` 采到的 KMI 世代。
+判断依据只能从设备上取，而且**不能只信 `uname -r`**。真机实测（2026-10-07，小米 17 `pudding`，Android 17 / SDK 37）：`uname -r` = `6.12.111-Jianke`（第三方内核，**没有 `androidNN` 标记**），而 vendor 模块的 vermagic 是 `6.12.69-android16-6-4k` → **实际 KMI = `android16`**。上表「Android 17 → KMI 6」在真机上对不上。
+
+KMI 世代的权威来源是 **vendor 模块的 vermagic**：
+
+```bash
+modinfo /vendor_dlkm/lib/modules/adsp_loader_dlkm.ko | grep vermagic
+```
+
+兜底顺序（vermagic → `uname -r` → `ro.boot.kmi`）由 `xiaomi17-device-recon` 采集，直接用它的 `KMI_GENERATION` 就行。
 
 > **一条需要留意的矛盾**：AOSP GKI 的 Android 17 分支是 `android17-6.18`（Linux 6.18），而这里说小米 17 的 Android 17 仍在 6.12。两者可能都对（厂商内核分支与 GKI 主线分支不必同步），但这意味着**「Android 版本 → Linux 版本」不能靠推**，必须读实机。
 

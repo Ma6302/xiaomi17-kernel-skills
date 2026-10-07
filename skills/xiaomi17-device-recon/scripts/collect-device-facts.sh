@@ -29,6 +29,39 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+# --- 运行环境前置检查 --------------------------------------------------------
+# 这个脚本必须在 **Android 侧的 shell** 里跑。Operit 自带的 proot Ubuntu 终端
+# 看上去「也是 Linux、也是 root」，但那里没有 getprop、没有 /data/adb、没有
+# /dev/block/by-name，而且那里的 su 是 Ubuntu 的 su（proot 里本来就是 root，
+# su -c 的语义完全不同）。
+#
+# 在那里跑**不会报错** —— 它会静默产出一份全 UNKNOWN 的 BLOCKED 档案。
+# 「写出了档案」和「档案是对的」是两件事，而且前者会让人以为已经可以往下走了。
+# 实测病例：2026-10-07，小米 17，Operit proot 终端里 --root 跑出全空档案。
+if [ "$MODE" != "adb" ]; then
+	if ! command -v getprop >/dev/null 2>&1; then
+		{
+			echo "环境错误：这个 shell 里没有 getprop。"
+			echo
+			echo "getprop 属于 Android 的 /system/bin。找不到它，说明你不在 Android 侧 shell 里 ——"
+			echo "最常见的场景是在 Operit 自带的 proot Ubuntu 终端里跑本脚本。"
+			echo "proot 里没有 getprop、没有 /data/adb、没有 /dev/block/by-name，"
+			echo "它自带的 su 也不是 Android 的 su。"
+			echo
+			echo "在那种环境里跑，本脚本不会报错，只会静默写出一份全 UNKNOWN 的档案。那比失败更糟。"
+			echo
+			echo "换一个通道再跑："
+			echo "  * Operit 的 Shizuku / Root 终端（不是 proot 终端）"
+			echo "  * 或从电脑跑：bash scripts/collect-device-facts.sh --adb"
+		} >&2
+		exit 3
+	fi
+	if [ ! -d /dev/block/by-name ]; then
+		echo "警告：看不到 /dev/block/by-name —— 分区清单与存在性判断会全部为空。" >&2
+		echo "  不致命，但请人工补齐，不要当成「这台设备没有分区」。" >&2
+	fi
+fi
+
 run() {
 	case "$MODE" in
 		adb)  adb shell "$*" 2>/dev/null | tr -d '\r' ;;
@@ -60,11 +93,114 @@ p_kmi_prop=$(first "$(prop ro.boot.kmi)")
 p_api=$(first "$(prop ro.vendor.api_level)")
 
 krel=$(first "$(run uname -r)")
-kmi_gen=$(printf '%s' "$krel" | sed -n 's/.*-\(android[0-9][0-9]*\)-.*/\1/p')
-kmi_gen="${kmi_gen:-$p_kmi_prop}"
 
-# android14-6.1 这类 KMI 世代字符串里的内核版本线
+# --- KMI 世代：三个来源，只信 uname -r 是不够的 ------------------------------
+# KMI 世代决定你该编/刷哪个 GKI 分支，也决定 vendor 的预编译模块认不认你的新内核。
+#
+# **跑第三方内核的设备上，uname -r 里可能根本没有 androidNN 标记** —— 编内核的人
+# 改过 CONFIG_LOCALVERSION。于是 KMI 恒为 UNKNOWN，整份档案被判成 BLOCKED，
+# 而设备其实一点毛病都没有。这是「来源单一」造成的误 BLOCK，不是设备问题。
+#
+# 实测病例（2026-10-07，小米 17，第三方内核）：
+#   uname -r                        -> 6.12.111-Jianke      （无 androidNN）
+#   getprop ro.boot.kmi             -> 空
+#   modinfo /vendor_dlkm/lib/modules/adsp_loader_dlkm.ko -F vermagic
+#                                   -> 6.12.69-android16-6-4k SMP preempt mod_unload modversions aarch64
+#   => KMI 世代 = android16
+# vermagic 是编模块时就固化进 .ko 的，换内核不会改它 —— 而这恰恰就是
+# 「新内核必须满足谁」的答案。所以它排在 uname -r 前面。
+kmi_uname=$(printf '%s' "$krel" | sed -n 's/.*-\(android[0-9][0-9]*\)-.*/\1/p')
+
+kmi_vermagic=""
+kmi_vermagic_src=""
+for _d in /vendor_dlkm/lib/modules /vendor/lib/modules; do
+	[ -d "$_d" ] || continue
+	_ko=$(ls "$_d"/*.ko 2>/dev/null | head -n1)
+	[ -n "$_ko" ] || continue
+	_vm=$(run "modinfo -F vermagic $_ko")
+	[ -n "$_vm" ] || _vm=$(run "strings $_ko" | grep -oE 'android[0-9]+-[0-9]+-[0-9]+k' | head -n1)
+	kmi_vermagic=$(printf '%s' "$_vm" | sed -n 's/.*\(android[0-9][0-9]*\)-.*/\1/p' | head -n1)
+	if [ -n "$kmi_vermagic" ]; then
+		kmi_vermagic_src="$_ko"
+		break
+	fi
+done
+
+kmi_gen=""
+kmi_src=""
+if [ -n "$kmi_vermagic" ]; then
+	kmi_gen="$kmi_vermagic"
+	kmi_src="vendor 模块 vermagic [$kmi_vermagic_src]"
+elif [ -n "$kmi_uname" ]; then
+	kmi_gen="$kmi_uname"
+	kmi_src="uname -r"
+elif [ -n "$p_kmi_prop" ]; then
+	kmi_gen="$p_kmi_prop"
+	kmi_src="ro.boot.kmi"
+fi
+
+# 三个来源互相矛盾时必须让 agent 看见。矛盾本身就是信息：
+# 它通常意味着有人换过内核或换过 vendor 分区，而不是「随便挑一个用」。
+kmi_conflict=""
+if [ -n "$kmi_vermagic" ] && [ -n "$kmi_uname" ] && [ "$kmi_vermagic" != "$kmi_uname" ]; then
+	kmi_conflict="uname -r 说 $kmi_uname，vendor 模块 vermagic 说 $kmi_vermagic —— 两者不一致，已取 vermagic"
+fi
+if [ -n "$kmi_gen" ] && [ -n "$p_kmi_prop" ] && [ "$kmi_gen" != "$p_kmi_prop" ]; then
+	kmi_conflict="${kmi_conflict:+$kmi_conflict；}ro.boot.kmi 说 $p_kmi_prop，与 $kmi_gen 不一致"
+fi
+
+# 运行中的内核版本线（6.12 这种）。它来自 uname -r，与 KMI 世代是两件事。
 kmi_line=$(printf '%s' "$krel" | sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+
+# --- 启动参数真值：/proc/bootconfig -------------------------------------------
+# 已 root 并装了隐藏模块（tricky_store / playintegrityfix / YH_YC 之类）的设备上，
+# getprop 报的 BL 锁定状态与验证启动状态是**被 resetprop 伪造过的**。
+# 实测病例（2026-10-07，小米 17，装了 YH_YC / tricky_store / playintegrityfix）：
+#   getprop ro.boot.flash.locked      -> 1       （实际已解锁）
+#   getprop ro.boot.verifiedbootstate -> green   （实际 orange）
+#   /proc/bootconfig 里：
+#     androidboot.vbmeta.device_state = "unlocked"
+#     androidboot.verifiedbootstate   = "orange"
+# /proc/bootconfig 是内核启动时收到的参数，resetprop 改不到它 —— 那里才是真值。
+# FLASH_LOCKED 直接用来判断「能不能刷」，判反了就是硬砖，所以这个优先级不能省。
+bcprop() {
+	run "cat /proc/bootconfig" | tr -d '"' \
+		| sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p" \
+		| head -n1
+}
+
+bc_device_state=$(first "$(bcprop androidboot.vbmeta.device_state)")
+bc_vbstate=$(first "$(bcprop androidboot.verifiedbootstate)")
+
+# 两个字段的语义是反的：ro.boot.flash.locked 是 1=锁；vbmeta.device_state 是 unlocked/locked。
+flash_locked_bc=""
+case "$bc_device_state" in
+	unlocked) flash_locked_bc="0" ;;
+	locked)   flash_locked_bc="1" ;;
+esac
+if [ -n "$flash_locked_bc" ]; then
+	flash_locked="$flash_locked_bc"
+	flash_locked_src="/proc/bootconfig [$bc_device_state]"
+else
+	flash_locked="$p_locked"
+	flash_locked_src="getprop ro.boot.flash.locked"
+fi
+if [ -n "$bc_vbstate" ]; then
+	vbstate="$bc_vbstate"
+	vbstate_src="/proc/bootconfig"
+else
+	vbstate="$p_vbstate"
+	vbstate_src="getprop ro.boot.verifiedbootstate"
+fi
+
+# 两者矛盾 = getprop 被伪造。这必须说出来，不能让 agent 以为读到的 1 是真的。
+spoof_warn=""
+if [ -n "$flash_locked_bc" ] && [ -n "$p_locked" ] && [ "$flash_locked_bc" != "$p_locked" ]; then
+	spoof_warn="getprop ro.boot.flash.locked=$p_locked 与 /proc/bootconfig 的 $bc_device_state 矛盾，已按 bootconfig 取 $flash_locked。getprop 在这台设备上不可信。"
+fi
+if [ -n "$bc_vbstate" ] && [ -n "$p_vbstate" ] && [ "$bc_vbstate" != "$p_vbstate" ]; then
+	spoof_warn="${spoof_warn:+$spoof_warn }getprop ro.boot.verifiedbootstate=$p_vbstate 与 /proc/bootconfig 的 $bc_vbstate 矛盾，已按 bootconfig 取 $bc_vbstate。"
+fi
 
 blockdev=$(run "ls /dev/block/by-name")
 partitions=$(printf '%s\n' "$blockdev" | grep -v '^$' | sort | paste -sd, -)
@@ -108,12 +244,38 @@ case "$root_mode" in
 	none) root_partition="none" ;;
 esac
 
+# 通道到底通没通？getprop 在、但四条最基本的信息全为空 —— 那不是「这台设备没有
+# 这些属性」，而是采集通道没工作（su 被解析成别的实现、或提权被拒后被
+# run() 的 2>/dev/null 吞掉了）。区分「没有」和「读不到」是本脚本存在的意义之一，
+# 所以这里必须停下，而不是把四个空字段写进档案。
+probe_ok=0
+for _v in "$p_device" "$p_model" "$p_platform" "$p_rel"; do
+	[ -n "$_v" ] && probe_ok=1
+done
+if [ "$probe_ok" = "0" ]; then
+	{
+		echo "环境错误：getprop 存在，但四条最基本的信息全为空："
+		echo "  ro.product.device / ro.product.model / ro.board.platform / ro.build.version.release"
+		echo
+		echo "这不是「这台设备没有这些属性」，而是采集通道没有工作。常见原因："
+		echo "  * 在 proot 之类非 Android shell 里跑（那里的 su 不是 Android 的 su）"
+		echo "  * 提权被拒，而 su 的提示被 2>/dev/null 吞掉了"
+		echo
+		echo "先解决通道，再采集。不要拿一份全空的档案往下走。"
+	} >&2
+	exit 3
+fi
+
 [ -n "$p_device" ]  || p_device="$UNKNOWN"
 [ -n "$p_slot" ]    || p_slot="(无，可能非 A/B)"
 [ -n "$krel" ]      || krel="$UNKNOWN"
 [ -n "$kmi_gen" ]   || kmi_gen="$UNKNOWN"
 [ -n "$kmi_line" ]  || kmi_line="$UNKNOWN"
 [ -n "$partitions" ]|| partitions="$UNKNOWN"
+[ -n "$flash_locked" ] || flash_locked="$UNKNOWN"
+[ -n "$p_verity" ]  || p_verity="$UNKNOWN"
+[ -n "$vbstate" ]   || vbstate="$UNKNOWN"
+[ -n "$kmi_src" ]   || kmi_src="三个来源都没取到"
 
 # 输出目录必须先确认可写。否则后面的 `cat > file` 会逐个报 "No such file or
 # directory"，脚本却仍然打印「已写出」——档案根本没落盘，而 agent 以为采集成功了。
@@ -157,10 +319,20 @@ VENDOR_SECURITY_PATCH=$p_vspl
 BUILD_DISPLAY_ID=$p_display
 KERNEL_RELEASE=$krel
 KMI_GENERATION=$kmi_gen
+KMI_SOURCE="$kmi_src"
+KMI_FROM_VERMAGIC=$kmi_vermagic
+KMI_FROM_UNAME=$kmi_uname
+KMI_FROM_PROP=$p_kmi_prop
+KMI_VERMAGIC_MODULE=$kmi_vermagic_src
+KMI_CONFLICT="$kmi_conflict"
 KERNEL_LINE=$kmi_line
 SLOT=$p_slot
-VERIFIED_BOOT_STATE=$p_vbstate
-FLASH_LOCKED=$p_locked
+VERIFIED_BOOT_STATE=$vbstate
+VERIFIED_BOOT_STATE_SOURCE="$vbstate_src"
+FLASH_LOCKED=$flash_locked
+FLASH_LOCKED_SOURCE="$flash_locked_src"
+FLASH_LOCKED_GETPROP=$p_locked
+SPOOF_WARNING="$spoof_warn"
 VERITY_MODE=$p_verity
 ANTI_ROLLBACK_INDEX=$p_anti
 ROOT_MODE=$root_mode
@@ -192,17 +364,37 @@ EOF
 	echo "| 安全补丁 | \`$p_spl\` / vendor \`$p_vspl\` | \`ro.*.build.security_patch\` |"
 	echo "| 当前 ROM | \`$p_display\` | \`ro.build.display.id\` |"
 	echo "| 内核 release | \`$krel\` | \`uname -r\` |"
-	echo "| KMI 世代 | \`$kmi_gen\` | 由 uname -r 解析 |"
+	echo "| KMI 世代 | \`$kmi_gen\` | $kmi_src |"
+	echo "| KMI 来源三值 | vermagic=\`$kmi_vermagic\` / uname=\`$kmi_uname\` / prop=\`$p_kmi_prop\` | 三者矛盾时取 vermagic |"
 	echo "| 内核主线 | \`$kmi_line\` | 由 uname -r 解析 |"
 	echo "| 当前槽位 | \`$p_slot\` | \`ro.boot.slot_suffix\` |"
-	echo "| 验证启动状态 | \`$p_vbstate\` | \`ro.boot.verifiedbootstate\` |"
-	echo "| BL 锁定 | \`$p_locked\`（1=锁，0=已解锁） | \`ro.boot.flash.locked\` |"
+	echo "| 验证启动状态 | \`$vbstate\` | $vbstate_src |"
+	echo "| BL 锁定 | \`$flash_locked\`（1=锁，0=已解锁） | $flash_locked_src |"
 	echo "| verity 模式 | \`$p_verity\` | \`ro.boot.veritymode\` |"
 	echo "| ARB 指数 | \`${p_anti:-$UNKNOWN}\` | \`ro.boot.anti\`（常为空，见下） |"
 	echo "| 现有 root | \`$root_mode\` | \`/data/adb\`、\`su -v\`、\`ksud\`、\`/proc/config.gz\` |"
 	echo "| root 补丁所在分区 | \`$root_partition\` | 分区存在性 + 管理器修补目标 |"
 	echo "| vendor API level | \`$p_api\` | \`ro.vendor.api_level\` |"
 	echo
+	if [ -n "$spoof_warn" ]; then
+		echo "## 警告：getprop 被隐藏模块伪造"
+		echo
+		echo "$spoof_warn"
+		echo
+		echo "在装了 tricky_store / playintegrityfix / YH_YC 这类隐藏模块的设备上，这是常态。"
+		echo "\`ro.boot.flash.locked\` 与 \`ro.boot.verifiedbootstate\` 一律优先信 \`/proc/bootconfig\`。"
+		echo "拿被伪造的 1（=已锁定）去判断「能不能刷」，会把结论判反。"
+		echo
+	fi
+	if [ -n "$kmi_conflict" ]; then
+		echo "## 警告：KMI 世代来源不一致"
+		echo
+		echo "$kmi_conflict"
+		echo
+		echo "来源不一致通常意味着这台设备换过内核、或换过 vendor 分区 —— 本身就是信息，"
+		echo "不要随手挑一个用。编内核时应以 vendor 模块 vermagic 为准（那才是新内核要满足的一方）。"
+		echo
+	fi
 	echo "## 现有 root 方案"
 	echo
 	if [ "$root_mode" = "none" ]; then
@@ -223,6 +415,21 @@ EOF
 		echo "脚本给的 \`$root_partition\` 只是推断，界面才是事实。"
 		echo
 		echo "LKM 模式还意味着：**SUSFS 拿不到**（它是内核源码级补丁，必须自编译内核走 GKI 模式）。"
+	fi
+	echo
+	echo "## 当前内核是不是原厂的"
+	echo
+	if [ -n "$kmi_uname" ]; then
+		echo "\`uname -r\` = \`$krel\`，带 KMI 标记 \`$kmi_uname\` —— 这是一个 GKI 构建（可能是原厂，也可能是在原厂基础上重编的）。"
+	else
+		echo "**\`uname -r\` = \`$krel\` 里没有 \`androidNN\` 标记。** 这通常意味着它**不是原厂 GKI 构建**"
+		echo "（编内核的人改过 \`CONFIG_LOCALVERSION\`）。"
+		echo
+		echo "这对「备份」的含义有直接影响：现在 \`dd\` 出来的 \`boot\` 备份**不是原厂镜像**，"
+		echo "它只能带你回到上一个第三方内核，回不到出厂状态。想要真正的退路，得从与当前"
+		echo "ROM 版本、ARB 指数都一致的官方 fastboot ROM 里取出原厂 \`boot.img\` / \`init_boot.img\`。"
+		echo
+		echo "也正因如此，KMI 世代不能靠 \`uname -r\` 判断 —— 见上表的 KMI 来源三值。"
 	fi
 	echo
 	echo "## 分区布局"
@@ -275,7 +482,19 @@ fi
 echo
 cat "$OUT_DIR/device-profile.md"
 
+# 档案写出来了，但它能用吗？把缺的 REQUIRED 字段逐个点名。
+# 「静默产出 + 只给一个 exit 3」对 agent 没有用 —— 它需要知道缺的是哪一项、该修什么。
+missing=""
+[ "$p_device" = "$UNKNOWN" ]     && missing="$missing DEVICE"
+[ "$krel" = "$UNKNOWN" ]         && missing="$missing KERNEL_RELEASE"
+[ "$kmi_gen" = "$UNKNOWN" ]      && missing="$missing KMI_GENERATION"
+[ "$flash_locked" = "$UNKNOWN" ] && missing="$missing FLASH_LOCKED"
+[ "$p_verity" = "$UNKNOWN" ]     && missing="$missing VERITY_MODE"
+
 if [ "$p_device" = "$UNKNOWN" ] || [ "$kmi_gen" = "$UNKNOWN" ]; then
+	[ -n "$missing" ] && echo "REQUIRED 字段缺：$missing" >&2
+	echo "脚本跑完了，但这不是一份可以往下走的档案。先补齐上面这些。" >&2
 	exit 3
 fi
+[ -n "$missing" ] && echo "注意：这些 REQUIRED 字段仍然缺 —— $missing" >&2
 exit 0

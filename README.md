@@ -78,7 +78,7 @@ build.env）原样回执给我，并明确列出所有值为 UNKNOWN 的字段�
 
 **在拿到 manifest 之前，「从官方源编一个小米 17 内核」这条路的可行性是未知的。** 现实的替代路径：
 
-1. **改 AOSP GKI 树，而不是厂商树。** `BOARD_USES_GENERIC_KERNEL_IMAGE=true` 意味着设备启动的**本来就是 Google 的 GKI 内核**，厂商树里那个 Image 会被丢弃。而 `aosp-mirror/kernel_common` 是**实测确认的完整树**：`android16-6.12` 有 72,991 条路径（`truncated:false`），含 `Makefile`、`kernel/sched/fair.c`、`mm/memory.c`、`init/main.c`、`arch/arm64/configs/gki_defconfig`、`build.config.gki.aarch64`。要改 zram / f2fs / 调度、要打 KernelSU，改这棵树就够。选哪个分支（`android16-6.12` / `android16-6.12-lts` / `android17-6.18`）**由实机 `uname -r` 与 KMI 世代决定**。详见 [`android-kernel-build-on-device`](skills/android-kernel-build-on-device/SKILL.md)。
+1. **改 AOSP GKI 树，而不是厂商树。** `BOARD_USES_GENERIC_KERNEL_IMAGE=true` 意味着设备启动的**本来就是 Google 的 GKI 内核**，厂商树里那个 Image 会被丢弃。而 `aosp-mirror/kernel_common` 是**实测确认的完整树**：`android16-6.12` 有 72,991 条路径（`truncated:false`），含 `Makefile`、`kernel/sched/fair.c`、`mm/memory.c`、`init/main.c`、`arch/arm64/configs/gki_defconfig`、`build.config.gki.aarch64`。要改 zram / f2fs / 调度、要打 KernelSU，改这棵树就够。选哪个分支（`android16-6.12` / `android16-6.12-lts` / `android17-6.18`）**由实机 KMI 世代决定**，不要从网上推。**本项目的目标设备已测定为 `android16`**（见下方已验证清单），所以分支就是 **`android16-6.12`** —— 也正好是唯一在 CI 上编出过 `Image` 的那条。详见 [`android-kernel-build-on-device`](skills/android-kernel-build-on-device/SKILL.md)。
 2. 用一个**已经拼装好的社区完整树**（自带构建脚本、能直接 `make` 的那种），在其上做功耗/压缩改动。
 3. **先不编译**：zram、调度参数、I/O 参数都能在已 root 的设备上通过 sysfs 调整，`zram-compression-tuning` 覆盖了这部分。**相当一部分压缩收益不需要编译内核。**
 
@@ -139,14 +139,17 @@ make -s kernelrelease = 6.12.52-4k-g105b5745f1d7
 - `aosp-mirror/kernel_common@android16-6.12` 是完整树（72,991 路径，关键文件齐全），`make gki_defconfig` + `make Image` 在干净 runner 上**成功**，32m54s，产出 33 MB 的 ARM64 `Image`
 - 该树 `gki_defconfig` 中 `ZRAM=m`、`ZRAM_MULTI_COMP=y`、`F2FS_FS_COMPRESSION=y`、`SCHED_CLASS_EXT=y`、`CFI_CLANG=y`、`MODVERSIONS=y`、`DEBUG_INFO_BTF=y`（数值取自 CI 实跑日志）
 - `MiCode/Xiaomi_Kernel_OpenSource@popsicle-w-oss` 只有 2,686 条路径、缺 `kernel/sched/fair.c` 等核心文件、无 `build/`、无 `tools/bazel`、无 `arch/arm64/configs/*_defconfig` —— **不能单独构建**
-- 代号 `pudding`=小米 17 / `pandora`=17 Pro / `popsicle`=17 Pro Max，同平台 `canoe`（来自 MiCode issue #40786 等，仍以实机 `getprop` 为准）
+- 代号 `pudding`=小米 17 / `pandora`=17 Pro / `popsicle`=17 Pro Max，同平台 `canoe`（来自 MiCode issue #40786 等；**其中 `pudding`=小米 17 已由真机 `getprop ro.product.device` 证实**）
 - `scripts/validate-skills.sh` 与 `scripts/install-to-operit.sh` 的行为（10 个 skill 全绿；安装幂等；格式错误会拒绝）
+- **真机实测（2026-10-07，手机端 Operit agent 采集）**：Xiaomi 17 `pudding`，HyperOS `OS4.0.0.32.XPCCNXM`，Android 17（SDK 37），slot `_a`；`uname -r` = `6.12.111-Jianke`（**第三方内核，不是原厂**）；**KMI 世代 = `android16`**，由 `/vendor_dlkm/lib/modules/adsp_loader_dlkm.ko` 的 `vermagic: 6.12.69-android16-6-4k` 读出；root = **KernelSU LKM，补丁在 `init_boot`**（`ksuinit: Loading kernelsu.ko..`）
+- **第三方内核与 `init_boot` 里的 KSU LKM 可以共存** —— 上述设备就是这种状态（这同时说明：换内核不一定掉 root，但取决于 KMI 与模块校验，仍未在本仓验证）
+- **`getprop` 在已 root 的设备上会撒谎**：同一台机器 `getprop ro.boot.flash.locked` 报 `1`、`ro.boot.verifiedbootstate` 报 `green`，而 `/proc/bootconfig` 是 `vbmeta.device_state = "unlocked"`、`verifiedbootstate = "orange"`（装有 `YH_YC`/`tricky_store`/`playintegrityfix`）。**BL 状态必须读 `/proc/bootconfig`**
 
 ## 未核实清单（诚实记录）
 
 这些是本仓库**没有**验证、或验证为否的：
 
-- **自编 GKI 的 Image 能否在小米 17 上真正启动** —— **未验证**。AVB/vbmeta 处理、厂商模块（`dio_dma_mapper.ko`/`mi_kernel_monitor.ko`/`gpu_stats.ko`）能否加载、KMI 是否兼容，三样都没验（`android/abi_gki_aarch64_qcom` 在厂商树里，不在 GKI 树里）
+- **自编 GKI 的 Image 能否在小米 17 上真正启动** —— **未验证**。AVB/vbmeta 处理、厂商模块（`dio_dma_mapper.ko`/`mi_kernel_monitor.ko`/`gpu_stats.ko`）能否加载、KMI 是否兼容，三样都没验（`android/abi_gki_aarch64_qcom` 在厂商树里，不在 GKI 树里）。真机上「第三方内核 + `init_boot` 里的 KSU LKM」这个组合确实跑着（`6.12.111-Jianke`），但那是别人编的、**不是我们编的那一个**
 - 官方树按 manifest 拼装后能否真正构建成功 —— **未知**（未做任何同步/构建）
 - `soc-repo`、`common`、`build`(kleaf)、`prebuilts` 是否有公开来源 —— **无法判定**（CLO 对匿名一律 401，含故意编造的不存在路径，故 401 不能证明存在）
 - `LTO`、`KERNEL_VERSION` 在树中的定义位置 —— **未知**（仅在 `build.config.constants` 与 `build.config.msm.common` 中有负证据）

@@ -133,7 +133,11 @@ make -s kernelrelease = 6.12.52-4k-g105b5745f1d7
 
 **为什么这是对的方向**：`BOARD_USES_GENERIC_KERNEL_IMAGE=true` 意味着设备启动的**本来就是 Google 的 GKI 内核**，厂商树里那个 Image 是被丢弃的。要改 zram / f2fs / 调度、要打 KernelSU，改 GKI 树就够，根本不需要那棵厂商树。
 
-**选哪个分支由设备的 `uname -r` 与 KMI 世代决定**——先跑 `xiaomi17-device-recon`，不要从网上推。小米 17 的 GKI 是 6.12（KMI 5 或 6 视 Android 版本）还是 6.18，**必须以实机为准**。
+**选哪个分支由设备的 KMI 世代决定**——先跑 `xiaomi17-device-recon`，不要从网上推。
+
+实机实测（2026-10-07，Xiaomi 17 `pudding`，HyperOS `OS4.0.0.32.XPCCNXM`，Android 17 / SDK 37）：`uname -r` = `6.12.111-Jianke`，**KMI 世代 = `android16`**（由 vendor 模块 `adsp_loader_dlkm.ko` 的 `vermagic: 6.12.69-android16-6-4k` 读出）→ **要编就编 `aosp-mirror/kernel_common` 的 `android16-6.12`**，而这也正是唯一在 CI 上实测编出过 `Image` 的分支。
+
+注意 `uname -r` 里的 `6.12.111` 与 vermagic 里的 `6.12.69` **不一致，这是正常的**：vendor 模块是跟着原厂内核编的，而设备当时跑的内核（`-Jianke`）是第三方重编的。**KMI 世代看 vermagic，不看 `uname -r`** —— 第三方内核改过 `CONFIG_LOCALVERSION` 之后 `uname -r` 里根本没有 `androidNN` 标记。
 
 **还没验证的一点**：自编 GKI 内核对厂商模块（`dio_dma_mapper.ko`、`mi_kernel_monitor.ko`、`gpu_stats.ko`）的兼容性取决于 KMI 符号表，而 `android/abi_gki_aarch64_qcom` 在厂商树里、不在 GKI 树里 —— **需要上机验证**。另外「能编出 Image」不等于「能在小米 17 上启动」：AVB、vbmeta、厂商模块加载都还没验证过。
 
@@ -151,12 +155,6 @@ make -s kernelrelease = 6.12.52-4k-g105b5745f1d7
   | `CONFIG_LTO_CLANG_THIN` | **defconfig 里没有**（由 AOSP 的 `build.config` 用 make 参数打开） |
 
   → **zram 多算法、f2fs 压缩、sched_ext 这三件「功耗/压缩调优」的正事，GKI 默认配置里就直接支持**。先去调 sysfs，不要为了这些去改 config（见 `zram-compression-tuning`）。
-
-**为什么这是对的方向**：`BOARD_USES_GENERIC_KERNEL_IMAGE=true` 意味着设备启动的**本来就是 Google 的 GKI 内核**，厂商树里那个 Image 是被丢弃的。要改 zram / f2fs / 调度、要打 KernelSU，改 GKI 树就够，根本不需要那棵厂商树。
-
-**选哪个分支由设备的 `uname -r` 与 KMI 世代决定**——先跑 `xiaomi17-device-recon`，不要从网上推。小米 17 的 GKI 是 6.12（KMI 5 或 6 视 Android 版本）还是 6.18，**必须以实机为准**。
-
-**还没验证的一点**：自编 GKI 内核对厂商模块（`dio_dma_mapper.ko`、`mi_kernel_monitor.ko`、`gpu_stats.ko`）的兼容性取决于 KMI 符号表，而 `android/abi_gki_aarch64_qcom` 在厂商树里、不在 GKI 树里 —— **需要验证**。
 
 ### 闸门 4：构建系统与 defconfig 名
 

@@ -42,6 +42,7 @@ bash ../xiaomi17-device-recon/scripts/collect-device-facts.sh --backup
 2. **落在机外**（电脑、U 盘、云盘）。存在同一个 /data 里，设备一旦进不了系统你取不出来。
 3. **有 SHA256 并且校验通过**。一个静默损坏的备份和被刷坏的设备一样无可挽回。
 4. **包含 vbmeta**。忘了它，后面想动 verity 时就没有退路。
+5. **清楚备份到的是不是原厂镜像。** 如果 `device-profile.md` 说当前内核**不是**原厂 GKI 构建（`uname -r` 里没有 `androidNN` 标记），那么 `dd` 出来的 `boot` 只是**上一个第三方内核**，不是原厂。它能带你回到「上一个能开机的状态」，回不到出厂。要真正的原厂退路，得从与当前 ROM 版本、ARB 指数都一致的官方 fastboot ROM 里取 `boot.img` / `init_boot.img`。
 
 ## 第三步：理解 ARB 到底管什么
 

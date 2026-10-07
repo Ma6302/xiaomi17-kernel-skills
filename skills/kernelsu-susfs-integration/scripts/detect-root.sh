@@ -15,6 +15,26 @@ p() { getprop "$1" 2>/dev/null || true; }
 has() { command -v "$1" >/dev/null 2>&1; }
 say() { printf '  %s\n' "$*"; }
 
+# --- 运行环境检查 ------------------------------------------------------------
+# 必须在 Android 侧的 shell 里跑。proot（Operit 自带的 Ubuntu 终端）里没有
+# getprop、没有 /data/adb，它自带的 su 也不是 Android 的 su —— 在那里跑，本脚本
+# 会报出「没有检测到已知的 root 管理器」，而设备其实有 root。
+# **假阴性比报错更危险**：agent 会以为设备是干净的，于是跳过备份。
+if ! command -v getprop >/dev/null 2>&1; then
+	{
+		echo "环境错误：这个 shell 里没有 getprop —— 不是 Android 侧的 shell。"
+		echo
+		echo "最常见的原因是在 Operit 自带的 proot Ubuntu 终端里跑。那里没有 getprop、"
+		echo "没有 /data/adb、没有 /dev/block/by-name，它自带的 su 也不是 Android 的 su。"
+		echo
+		echo "在那里跑，本脚本会得出「没有检测到已知的 root 管理器」—— 一个假阴性。"
+		echo "它比报错更危险：你会以为设备是干净的，于是不做任何备份就往下走。"
+		echo
+		echo "改用 Operit 的 Shizuku / Root 终端再跑。"
+	} >&2
+	exit 3
+fi
+
 echo "=== 内核与平台 ==="
 say "uname -r            = $(uname -r)"
 say "uname -v            = $(uname -v 2>/dev/null)"
@@ -30,6 +50,31 @@ if [ -r /proc/config.gz ]; then
 	done
 else
 	say "/proc/config.gz 不存在（CONFIG_IKCONFIG_PROC 没开）—— 无法直接读当前内核配置"
+fi
+
+echo
+echo "=== 启动参数真值（getprop 可能是假的） ==="
+# 装了隐藏模块（tricky_store / playintegrityfix / YH_YC 之类）的设备上，resetprop
+# 会伪造 BL 锁定状态和验证启动状态。实测病例（2026-10-07，小米 17）：
+#   getprop ro.boot.flash.locked      -> 1      实际已解锁
+#   getprop ro.boot.verifiedbootstate -> green  实际 orange
+# /proc/bootconfig 是内核收到的启动参数，resetprop 改不到它。
+if [ -r /proc/bootconfig ]; then
+	BC="$(cat /proc/bootconfig | tr -d '"')"
+	bc_dev="$(printf '%s\n' "$BC" | sed -n 's/^[[:space:]]*androidboot\.vbmeta\.device_state[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)"
+	bc_vb="$(printf '%s\n' "$BC" | sed -n 's/^[[:space:]]*androidboot\.verifiedbootstate[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)"
+	say "/proc/bootconfig   vbmeta.device_state = ${bc_dev:-（未找到）}"
+	say "/proc/bootconfig   verifiedbootstate   = ${bc_vb:-（未找到）}"
+	say "getprop            flash.locked        = $(p ro.boot.flash.locked)   <- 可能被伪造"
+	say "getprop            verifiedbootstate   = $(p ro.boot.verifiedbootstate)   <- 可能被伪造"
+	if [ -n "$bc_vb" ] && [ "$bc_vb" != "$(p ro.boot.verifiedbootstate)" ]; then
+		say ""
+		say "**不一致：getprop 报的是假的。** 以 /proc/bootconfig 为准。"
+		say "判断「能不能刷」必须看 vbmeta.device_state，不是 flash.locked。"
+	fi
+else
+	say "/proc/bootconfig 读不到 —— BL 与验证启动状态只能靠 getprop，"
+	say "而在这个设备类别上 getprop 可能被隐藏模块伪造，请人工确认。"
 fi
 
 echo
@@ -137,6 +182,11 @@ cat <<'TXT'
       要 → 两套 KSU 同时存在会互相打架。原厂 init_boot 从备份里取。
   3. 有没有 /data/adb 下的重要状态（模块、隐藏列表、白名单）需要先导出？
   4. 目标内核的 KMI 与设备当前 KMI 是否一致？
-     Android 16 → Linux 6.12.23 / KMI 5；Android 17 → Linux 6.12.69 / KMI 6。
+     Android 16 常见 Linux 6.12.23；Android 17 常见 Linux 6.12.69。
+     **但这只是社区对照，不要拿它当依据**：OEM 分支与 GKI 主线不必同步，而且
+     跑第三方内核时 uname -r 里的 androidNN 标记可能被改掉。
+     权威来源是 vendor 模块的 vermagic：
+       modinfo -F vermagic /vendor_dlkm/lib/modules/*.ko | head -1
+       # -> 6.12.69-android16-6-4k ...  => KMI 世代 = android16
      KMI 不匹配时，厂商预编译模块会拒绝加载。
 TXT
