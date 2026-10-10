@@ -72,6 +72,8 @@ def bootstrap_ratio_ci(a, b, draws, rng):
         if da:
             out.append(db / da)
     out.sort()
+    if not out:                       # 可能发生在所有 A 值都是 0 时；调用方按"测不出来"处理
+        return float("nan"), float("nan"), point
     lo = out[int(0.025 * len(out))]
     hi = out[int(0.975 * len(out)) - 1]
     return lo, hi, point
@@ -116,21 +118,25 @@ def main():
     print("=== 比值 B/A（median(B)/median(A)） ===")
     print(f"  点估计 = {point:.4f}  ({(delta)*100:+.2f}%)")
     print(f"  bootstrap {args.draw} 次 95% CI = [{lo:.4f}, {hi:.4f}]")
-    print(f"  CI 是否跨 1.0 = {'是' if lo <= 1.0 <= hi else '否'}")
+    # ── 判据 ①：CI 跨不跨 1.0（主判据，永远是第一步） ──────────────────
+    ci_ok = lo == lo and hi == hi
+    crossed = (not ci_ok) or (lo <= 1.0 <= hi)
+    print(f"  CI 是否跨 1.0 = {'是' if crossed else '否'}"
+          f"{'' if ci_ok else '（CI 计算失败，按测不出来处理）'}")
 
     direction, threshold, midband = THRESH[args.metric]
     print()
     print(f"=== 判据（metric={args.metric}，更好方向={direction}，通过阈值={threshold}） ===")
 
-    # 先做阈值/区间判定，再由置信区间决定这份判定算不算数。
-    # 顺序很关键：CI 是主判据，2×CV 只是对幅度的一句提醒。
-    crossed = lo <= 1.0 <= hi
-    in_midband = midband[0] < point < midband[1]
+    # 判定顺序固定为 ① CI 跨不跨 1.0 → ② 阈值 → ③ 幅度，不可颠倒。
+    # 拿 2×CV（幅度）先否掉结论，会把一个已被 CI 证实的真实小效应误判成
+    # "测不出来"——本脚本早期版本犯过这个错，所以顺序写死在代码里。
+    in_midband = midband[0] < point < midband[1]          # ② 阈值
     if direction == "lower":
         meets_threshold = point <= threshold and hi < 1.0
     else:  # higher 更好
         meets_threshold = point >= threshold and lo > 1.0
-    marginal = abs(delta) < 2 * cv
+    marginal = abs(delta) < 2 * cv                        # ③ 幅度（只是提醒）
 
     verdict = None
     if crossed:

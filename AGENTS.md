@@ -130,19 +130,28 @@ write access — never a classic `repo`-scoped token, and never grant
 ## Where the kernel project lives
 
 **Not in this repository.** This one is MIT and deliberately ships no upstream
-code. The kernel project — KernelSU/SUSFS patches, `zram-ir`, config
-fragments, build scripts, boot images — is GPL-2.0 by derivation, so it belongs
-in a **separate repository**. Keep the licence boundary and the repository
-boundary in the same place.
+code. The kernel project — patches, config fragments, build scripts, boot
+images — is GPL-2.0 by derivation, so it belongs in a **separate repository**.
+Keep the licence boundary and the repository boundary in the same place.
 
-That repository should be a **patch stack, not a fork**: no kernel source, only
-`patches/` + `config/` + `scripts/` + CI that clones upstream `kernel_common`
-at a pinned ref and applies the patches. That keeps it small enough to clone on
-the phone, and makes every build reproducible from a pinned upstream ref.
+That repository now exists: **`Ma6302/xiaomi17-kernel`** (GPL-2.0-only). It is a
+**patch stack, not a fork** — it carries no kernel source, only
+`versions.lock` + `scripts/` + `config/` + `docs/` + `analysis/`, and its build
+script clones the upstream tree at a **pinned commit** and asserts the SHA.
+Keeping it source-free is what makes it small enough to clone on the phone and
+makes every build reproducible from a pinned upstream ref.
+
+**Its `versions.lock` is the single source of truth** (upstream branch + commit
+SHA, toolchain revisions, the produced `Image`/package md5s, boot indexes, and
+the ABI baseline). Treat the sibling repo as a working reference for both this
+skill set's claims and its own conventions — but do not copy device facts out of
+it into a skill body; those still belong in the runtime `device-profile.md`.
 
 The only kernel artefacts that stay *here* are workflows whose purpose is to be
 **reproducible evidence for a claim made in a skill** — see
-`.github/workflows/gki-build-check.yml`.
+`.github/workflows/gki-build-check.yml`. Note what that workflow actually proved:
+the AOSP upstream tree **compiles** — and the resulting `Image` **does not boot**
+on this device. It is evidence about the CI pipeline, not about the kernel.
 
 Creating that repository is itself a procedure: see the
 `kernel-project-repo-bootstrap` skill. Note its central caveat — a branch

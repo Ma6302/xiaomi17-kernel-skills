@@ -1,195 +1,603 @@
-# 内核构建 workflow 模板（复制到 .github/workflows/build-kernel.yml）
+# =============================================================================
+# 内核血统自检 + 编译期冒烟测试 + ABI 第①项      （复制到 .github/workflows/）
 #
-# ⚠️ 先读这一段再决定要不要用这个模板：
-#   本模板走的是「多仓库 kernel_platform + Kleaf + build_with_bazel.py」这条路，
-#   需要你先拿到 manifest（MiCode 不提供，高通 CLO 需账号）。在拿到之前它编不起来。
+# 本模板的定位：**CI 能证明什么、不能证明什么**。改这个文件之前先读这三段。
 #
-#   **更简单的一条路**：直接 clone AOSP GKI 树 aosp-mirror/kernel_common@android16-6.12
-#   （实测 72,991 条路径、truncated:false，自带完整源码与顶层 Makefile，
-#   可以直接 make ARCH=arm64 LLVM=1 gki_defconfig && make -j）。
-#   设备启动的本来就是 GKI 内核（BOARD_USES_GENERIC_KERNEL_IMAGE=true），
-#   厂商树里的 Image 会被丢弃 —— 改功耗/压缩/调度、打 KernelSU，GKI 树就够。
-#   如果走那条路，把下面 job 里的 checkout/clone 段换成 kernel_common，
-#   构建段换成 make，其余（磁盘清理、缓存、Release、SHA256SUMS）照用。
-#   细节见 SKILL.md「备用方案一」。
+# ★ 它证明什么
+#     1. clone 到的树就是 pin 死的 cctv18 树（commit SHA / SUBLEVEL / 关键文件 /
+#        路径数 / 厂商适配标志）；
+#     2. 这棵树 + 这套 AOSP prebuilt 工具链在干净机器上能编过；
+#     3. Module.symvers 与树自带 gki/aarch64/abi.stg 的第①项 ABI 判据 DIFF = 0
+#        （基线 10235 个符号）。
 #
-# ⚠️ 使用前必须做的事：
-#   1. 先按 SKILL.md 第零步确认源码树是完整的（路径数万级，而不是几千级）。
-#   2. 改掉所有标了 "TODO 核实" 的地方 —— 那些是这台设备/这棵树的具体值，
-#      模板里给的值来自 2026-10 的一次实测，可能已经过期。
-#   3. workflow_dispatch 只认默认分支上已经存在的 workflow，
-#      所以第一次要先把它合进默认分支，再触发。
+# ★ 它不证明什么
+#     - **不证明内核能开机。** 唯一能证明的是真机刷入。实测反例：AOSP 上游树
+#       编出的内核 ABI 全对齐（msm_drm DIFF=0、struct module 1600/75、
+#       kobject_uevent_env 0x8bb6d45c）仍然卡第一屏。
+#     - **不产出可刷内核。** 这些产物是证据，不是交付件；不要拿它去刷机。
+#     - 不跑 ABI 第②/③/④ 项（需要设备上的 .ko 与 pahole + vmlinux）。
 #
-# 设计取舍（为什么这么写）：
-#   * fetch-depth: 1 —— 小米内核树有 1,260,958 个 commit，浅克隆是唯一可行解。
-#   * --disk_cache 而不是 ccache —— Kleaf 是 hermetic Bazel 构建，ccache 无效。
-#   * 缓存用 restore/save 分离 + if: always() —— 避免刷爆每仓库 10GB 配额。
-#   * 产物发 Release 而不是 artifact —— 手机端下载 artifact 要登录且域名被墙。
-#   * 产出 SHA256SUMS —— 经反代/镜像之后唯一能自证没被改的东西。
+# ★ 三条硬约束（改这个文件时不要破坏）
+#     1. **不要写 set -u** —— _setup_env.sh 引用 _SETUP_ENV_SH_INCLUDED 等可能
+#        未定义的变量，set -u 下立刻 abort。
+#     2. **不要引入 ftrace**（FUNCTION_TRACER / STACK_TRACER）—— struct module
+#        会从 1600/75 变成 1664/77，msm_drm.ko 拒载，卡第一屏。
+#     3. **失败时不要"降级重编"**，尤其不要因为 `load BTF from vmlinux` 去关
+#        CONFIG_DEBUG_INFO_BTF：正解是把 AOSP build-tools 的 prebuilt pahole
+#        放到 PATH 最前面。降级会掩盖真实的编译错误。
+#
+# ★ 实测基线（2026-10-08，本地 WSL2 Ubuntu 24.04 / 16 核 / 12GB，**不是 CI**）：
+#     make 6 分 19 秒，error count 0，Image = 41,896,448 字节，交付口径是 md5。
+#     这套流程在 GitHub runner 上还没跑过 —— 见文件末尾的 UNVERIFIED 清单。
+#
+# ★ 校验和口径：md5，不是 sha256。仓内交付镜像只有 md5（versions.lock 的
+#   image_md5 / package_md5）；唯一一处 sha256 出现在历史 CI 产物记录里，那是
+#   那一次自加的口径。
+# =============================================================================
 
-name: build-kernel
+name: kernel-lineage-abi-check
 
 on:
   workflow_dispatch:
     inputs:
-      target:
-        description: '构建 target（如 pudding / popsicle / pandora）'
+      expected_commit:
+        description: '期望的上游 commit SHA（必须与内核工程仓 versions.lock 的 [upstream] commit 一致）'
         required: true
-        default: 'pudding'          # TODO 核实：pudding = Xiaomi 17（以真机 getprop 为准）
-      variant:
-        description: 'variant（perf 或 consolidate）'
+        default: '58ee67741556c83c523f48518284c4a6b1ef31d6'
+      expected_sublevel:
+        description: '期望的 SUBLEVEL（= 设备原厂内核版本号末段）'
         required: true
-        default: 'perf'
+        default: '69'
       release_tag:
-        description: '发到哪个 Release tag'
+        description: '可选：把证据发到哪个 Release tag（留空则只上传 artifact）'
         required: false
-        default: 'kernel-latest'
+        default: ''
 
 permissions:
-  contents: write      # 发 Release 需要
+  contents: write        # 只有可选的 Release 步骤需要；不需要发 Release 可以降成 read
+
+env:
+  # ★ 这些默认值必须与内核工程仓 versions.lock 的 [upstream] / [toolchain] 段一致。
+  #   写在这里是因为 workflow 可能跑在另一个仓库里；若本仓带了一份 versions.lock，
+  #   下面的「读 versions.lock」步骤会用文件里的值覆盖它们，并且在不一致时失败。
+  UPSTREAM_URL: 'https://github.com/cctv18/android_gki_kernel_common'
+  UPSTREAM_BRANCH: 'android16-6.12-2026-03'
+  CLANG_VERSION: 'r536225'          # versions.lock [toolchain] clang_version（= clang 19.0.1）
+  RUST_VERSION: '1.82.0.p2'         # versions.lock [toolchain] rust_version
+  ABI_BASELINE_SYMBOLS: '10235'     # versions.lock [abi_baseline] symvers_vs_abistg
+  SRC: ${{ github.workspace }}/src
+  OUT: ${{ github.workspace }}/out
+  TC: ${{ github.workspace }}/tc
 
 jobs:
-  build:
+  lineage-and-abi:
     runs-on: ubuntu-24.04
-    # 托管 runner 单 job 硬上限就是 6 小时（360 分钟），larger runner 也一样。
-    # 设成 350 留出收尾时间；真正需要更久只能上 self-hosted。
-    timeout-minutes: 350
-
-    env:
-      # TODO 核实：这些分支/仓库名是 2026-10 的实测值
-      KERNEL_REPO: MiCode/Xiaomi_Kernel_OpenSource
-      KERNEL_BRANCH: popsicle-w-oss
-      DEVICETREE_REPO: MiCode/kernel_devicetree
-      BUILD_REPO: MiCode/kernel_build
-      BUILD_BRANCH: annibale-w-oss      # TODO 核实：MiCode/kernel_build 没有 popsicle 分支
-      WORKSPACE: ${{ github.workspace }}/kernel_platform
+    # 这条链在 CI 上的真实耗时 UNVERIFIED（本地 6分19秒，AOSP 上游树在 4 vCPU
+    # runner 上是 32分54秒）。托管 runner 的硬上限是 6 小时，这里留足余量。
+    timeout-minutes: 300
 
     steps:
-      - name: 腾出磁盘
-        # 内核构建要 20-40GB，而 runner 只有约 14GB 可用。
-        uses: jlumbroso/free-disk-space@main
+      # ------------------------------------------------------------------ 准备
+      - uses: actions/checkout@v4
+
+      - name: 读 versions.lock（唯一真相来源）
+        # 上游 SHA 与工具链版本一律从 versions.lock 取，不在 workflow 里写死。
+        # 建议把内核工程仓的 versions.lock 复制一份进本仓，让 CI 的 pin 有单一出处。
+        run: |
+          set -eo pipefail            # ★ 不要加 -u
+          LOCK=""
+          for c in versions.lock kernel-dev/versions.lock .github/versions.lock; do
+            if [ -f "$c" ]; then LOCK="$c"; break; fi
+          done
+
+          if [ -z "$LOCK" ]; then
+            echo "::warning::本仓没有 versions.lock —— 退回 dispatch 输入里的 SHA，可能与内核工程仓漂移"
+            {
+              echo "EXPECTED_COMMIT=${{ inputs.expected_commit }}"
+              echo "EXPECTED_SUBLEVEL=${{ inputs.expected_sublevel }}"
+            } >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "versions.lock = $LOCK"
+          lock_get() {
+            awk -v sect="[$1]" -v key="$2" '
+              /^\[/ { cur=$0; next }
+              cur==sect && $0 ~ "^"key"[[:space:]]*=" {
+                sub("^[^=]*=[[:space:]]*", ""); print; exit
+              }' "$LOCK"
+          }
+
+          L_URL="$(lock_get upstream url)"
+          L_BRANCH="$(lock_get upstream branch)"
+          L_COMMIT="$(lock_get upstream commit)"
+          L_SUB="$(lock_get tree sublevel)"
+          L_CLANG="$(lock_get toolchain clang_version)"
+          L_RUST="$(lock_get toolchain rust_version)"
+
+          # 血统自检第 0 步：dispatch 输入与 lock 文件必须一致，不一致就停。
+          [ "${{ inputs.expected_commit }}" = "$L_COMMIT" ] || {
+            echo "::error::输入 expected_commit=${{ inputs.expected_commit }} 与 versions.lock 的 $L_COMMIT 不一致"
+            exit 1; }
+          [ "${{ inputs.expected_sublevel }}" = "$L_SUB" ] || {
+            echo "::error::输入 expected_sublevel=${{ inputs.expected_sublevel }} 与 versions.lock 的 $L_SUB 不一致"
+            exit 1; }
+
+          {
+            echo "UPSTREAM_URL=$L_URL"
+            echo "UPSTREAM_BRANCH=$L_BRANCH"
+            echo "EXPECTED_COMMIT=$L_COMMIT"
+            echo "EXPECTED_SUBLEVEL=$L_SUB"
+            [ -n "$L_CLANG" ] && echo "CLANG_VERSION=$L_CLANG"
+            [ -n "$L_RUST" ]  && echo "RUST_VERSION=$L_RUST"
+          } >> "$GITHUB_ENV"
+
+      - name: 环境诊断与腾磁盘
+        # 本地实测：源码树约 1.9GB + 输出约 2GB，建议预留 10GB。
+        # CI 上的峰值占用 UNVERIFIED，所以这一步留着（很便宜）。
+        run: |
+          echo "=== CPU ==="; nproc
+          echo "=== RAM ==="; free -h
+          echo "=== 磁盘（清理前）==="; df -h /
+
+      - uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: true
+          preinstalled-runtimes: true     # 旧名 tool-cache
           android: true
           dotnet: true
           haskell: true
           large-packages: false
           swap-storage: false
 
-      - name: 准备 workspace 骨架（多仓库拼装）
-        # 这棵树不能单独构建：它引用父级 workspace 的 build/、soc-repo/、
-        # external/qcom-dtc/ 和 tools/bazel。缺任一个都会失败。
+      - name: 安装构建依赖
+        # ★ 刻意不装 dwarves：它会带来发行版的 pahole 1.25，正是那个编不出 BTF 的版本。
+        # ★ libdw-dev 必装：6.12 的 CONFIG_MODVERSIONS 走新的 gendwarfksyms（基于 DWARF），
+        #   它 include <dwarf.h>，缺了会挂在 scripts/ 目录报
+        #   "scripts/gendwarfksyms/gendwarfksyms.h:6:10: fatal error: 'dwarf.h' file not found"
+        #   —— 报错点与真正的原因（少装一个 -dev 包）看起来毫无关系。
         run: |
-          set -eux
-          mkdir -p "$WORKSPACE"
-          cd "$WORKSPACE"
+          set -eo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            bc bison flex libssl-dev libelf-dev libdw-dev \
+            make gcc tar xz-utils zip unzip cpio rsync python3 git
+          df -h /
 
-          # 1) 内核源码（稀疏树，放进 msm-kernel/）
-          git clone --depth 1 --branch "$KERNEL_BRANCH" \
-            "https://github.com/${KERNEL_REPO}.git" msm-kernel
-
-          # 2) Kleaf 构建系统 —— 提供 tools/bazel、build/kernel/kleaf/*
-          git clone --depth 1 --branch "$BUILD_BRANCH" \
-            "https://github.com/${BUILD_REPO}.git" build || \
-            echo "::warning::kernel_build 获取失败，构建几乎肯定无法进行"
-
-          # 3) 设备树
-          git clone --depth 1 --branch "$KERNEL_BRANCH" \
-            "https://github.com/${DEVICETREE_REPO}.git" msm-kernel-dt || true
-
-          # 4) TODO 核实：soc-repo 与 external/qcom-dtc 没有公开来源。
-          #    build.config.msm.popsicle 引用 soc-repo/build.config.msm.canoe，
-          #    bazel.WORKSPACE 引用 external/qcom-dtc。两者缺失时构建会在这里停住。
-          #    有 CLO（Codelinaro）账号后按 release-w-qcom-sm8850 manifest 同步，见下。
-          echo "::warning::soc-repo / external/dtc 需要 Qualcomm CLO 的 release-w-qcom-sm8850 manifest"
-
-      - name: 取得工具链
-        # 版本从 build.config.constants 读，不要写死。
+      # -------------------------------------------------------------- 血统自检
+      - name: 血统自检 ①：clone cctv18 树并断言 commit SHA
         run: |
-          set -eux
-          cd "$WORKSPACE/msm-kernel"
-          CLANG_VER="$(grep -E '^CLANG_VERSION=' build.config.constants | cut -d= -f2)"
-          echo "CLANG_VER=$CLANG_VER" >> "$GITHUB_ENV"
-          echo "从 build.config.constants 读到 CLANG_VERSION=$CLANG_VER"
+          set -eo pipefail            # ★ 不要加 -u
+          [ -n "${EXPECTED_COMMIT:-}" ] || { echo "::error::EXPECTED_COMMIT 为空"; exit 1; }
+          echo "上游    : $UPSTREAM_URL"
+          echo "分支    : $UPSTREAM_BRANCH"
+          echo "期望 SHA: $EXPECTED_COMMIT"
 
-          mkdir -p "$WORKSPACE/prebuilts/clang/host/linux-x86"
-          cd "$WORKSPACE/prebuilts/clang/host/linux-x86"
-          # 用 gitiles 的目录归档一次性取，比 clone 快得多。
-          # ⚠️ 坑：build.config.constants 里的值是 r536225，但仓库里的**目录名**是 clang-r536225，
-          #    归档 URL 与本地解压目录都必须带 clang- 前缀。
-          #    写成 ${CLANG_VER}.tar.gz 会得到 HTTP 400，报错信息完全看不出原因。
-          #    先用 gitiles 的 JSON 列表确认目录存在，再下载：
-          #      curl -fsSL 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/refs/heads/main/?format=JSON'
-          CLANG_DIR="clang-${CLANG_VER}"
-          curl -fsSL -o clang.tar.gz \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_DIR}.tar.gz"
-          mkdir -p "$CLANG_DIR" && tar -xzf clang.tar.gz -C "$CLANG_DIR"
-          rm -f clang.tar.gz
+          # 不用 --filter=blob:none 之后再检出整个工作区：7 万+ 文件会退化成
+          # 逐 blob 懒加载，而且与 --3way 不兼容。
+          git clone --depth=1 --branch "$UPSTREAM_BRANCH" "$UPSTREAM_URL" "$SRC"
 
-      - name: 恢复 Bazel 缓存
-        # Kleaf 是 hermetic 构建，ccache 不起作用；要缓存的是 Bazel action cache。
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ${{ env.WORKSPACE }}/bazel-cache
-            ${{ env.WORKSPACE }}/repository-cache
-          key: bazel-${{ env.KERNEL_BRANCH }}-${{ inputs.target }}-${{ inputs.variant }}-${{ github.run_id }}
-          restore-keys: |
-            bazel-${{ env.KERNEL_BRANCH }}-${{ inputs.target }}-${{ inputs.variant }}-
+          # 远端分支移动是正常的（我们 pin 的是历史 commit），所以只报告、不失败。
+          REMOTE_SHA="$(git ls-remote "$UPSTREAM_URL" "refs/heads/$UPSTREAM_BRANCH" | awk '{print $1}')"
+          echo "远端 $UPSTREAM_BRANCH 当前指向 = ${REMOTE_SHA:-<读不到>}"
 
-      - name: 构建
-        # 注意：build_with_bazel.py 必须从 workspace 根目录运行，它会做
-        # workspace = 脚本目录/.. 的推导。默认产物目录是
-        # out/msm-kernel-<target>-<variant>。
-        run: |
-          set -eux
-          cd "$WORKSPACE"
-          python3 msm-kernel/build_with_bazel.py \
-            -t "${{ inputs.target }}" "${{ inputs.variant }}" \
-            --cache_dir "$WORKSPACE/bazel-cache" \
-            --log info
-
-      - name: 保存 Bazel 缓存
-        # save 放在 always() 里：构建失败时的部分缓存同样有价值。
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ${{ env.WORKSPACE }}/bazel-cache
-            ${{ env.WORKSPACE }}/repository-cache
-          key: bazel-${{ env.KERNEL_BRANCH }}-${{ inputs.target }}-${{ inputs.variant }}-${{ github.run_id }}
-
-      - name: 收集产物并生成校验和
-        if: success()
-        run: |
-          set -eux
-          DIST="$WORKSPACE/out/msm-kernel-${{ inputs.target }}-${{ inputs.variant }}/dist"
-          mkdir -p release
-          if [ -d "$DIST" ]; then
-            cp -v "$DIST"/Image* "$DIST"/*.img "$DIST"/dtb* "$DIST"/System.map release/ 2>/dev/null || true
-            # .ko 与模块加载顺序必须一起带出来，否则刷完模块加载不上
-            [ -d "$DIST" ] && find "$DIST" -maxdepth 1 -name '*.ko' -exec cp -v {} release/ \; || true
-            for f in modules.load modules.dep modules.alias modules.softdep vendor_dlkm.modules.load; do
-              [ -f "$DIST/$f" ] && cp -v "$DIST/$f" release/ || true
-            done
-            [ -f "$DIST/.config" ] && cp -v "$DIST/.config" release/kernel.config || true
+          ACTUAL="$(git -C "$SRC" rev-parse HEAD)"
+          if [ "$ACTUAL" != "$EXPECTED_COMMIT" ]; then
+            echo "HEAD=$ACTUAL != pin=$EXPECTED_COMMIT —— 按 SHA 精确检出"
+            git -C "$SRC" fetch --depth=1 origin "$EXPECTED_COMMIT"
+            git -C "$SRC" checkout --detach FETCH_HEAD
+            ACTUAL="$(git -C "$SRC" rev-parse HEAD)"
           fi
-          ls -la release/
-          # SHA256SUMS 是经过反代/镜像之后唯一能自证产物完整的东西
-          ( cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS )
+          [ "$ACTUAL" = "$EXPECTED_COMMIT" ] || {
+            echo "::error::SHA 不匹配 expect=$EXPECTED_COMMIT got=$ACTUAL"; exit 1; }
+          echo "OK: HEAD = $ACTUAL"
 
-      - name: 发布到 Release
-        # 用 Release asset 而不是 artifact：artifact 下载需要登录，
-        # 而且和 raw/objects.githubusercontent.com 一样在国内常被墙。
-        if: success()
+      - name: 血统自检 ②：SUBLEVEL / 关键文件 / 路径数 / 厂商适配标志
+        run: |
+          set -eo pipefail
+          fail=0
+
+          echo "--- Makefile ---"
+          sed -n '1,6p' "$SRC/Makefile"
+          SUB="$(awk '/^SUBLEVEL/{print $3}' "$SRC/Makefile")"
+          echo "SUBLEVEL: expect=${EXPECTED_SUBLEVEL:-?} actual=${SUB}"
+          if [ -n "${EXPECTED_SUBLEVEL:-}" ] && [ "$SUB" != "$EXPECTED_SUBLEVEL" ]; then
+            echo "::error::SUBLEVEL 不符（版本号必须与设备原厂一致）"; fail=1
+          fi
+
+          echo "--- gki_defconfig 首行（LOCALVERSION 必须带 -4k）---"
+          head -1 "$SRC/arch/arm64/configs/gki_defconfig"
+
+          echo "--- 关键文件 ---"
+          for f in arch/arm64/configs/gki_defconfig kernel/sched/fair.c mm/memory.c \
+                   init/main.c include/linux/module.h kernel/trace/Kconfig \
+                   _setup_env.sh gki/aarch64/abi.stg build.config.gki \
+                   build.config.constants build.config.gki.aarch64; do
+            if [ -e "$SRC/$f" ]; then echo "  OK   $f"; else echo "  MISS $f"; fail=1; fi
+          done
+
+          echo "--- 路径数（稀疏树会在这里露馅，实测基线约 87186）---"
+          N="$(find "$SRC" -path "$SRC/.git" -prune -o -type f -print | wc -l)"
+          echo "  $N 个文件"
+          if [ "$N" -lt 50000 ]; then
+            echo "::error::只有 $N 个文件 —— 这是稀疏树，编不出内核"; fail=1
+          fi
+
+          echo "--- 厂商适配标志（血统判据）---"
+          # 这四项是内核工程仓 fetch-sources.sh 当作核心判据的；缺任一项 = 血统错了
+          # （AOSP 上游树里根本没有对应的 Kconfig）。先在 gki_defconfig 里找，
+          # 找不到再退到整个 arch/arm64/configs/ 目录搜。
+          for k in GKI_HACKS_TO_FIX GKI_TASK_STRUCT_VENDOR_SIZE_MAX \
+                   GCMA RT_SOFTIRQ_AWARE_SCHED; do
+            if grep -qm1 "$k" "$SRC/arch/arm64/configs/gki_defconfig"; then
+              echo "  OK   $k  (gki_defconfig)"
+            else
+              WHERE="$(grep -rl "$k" "$SRC/arch/arm64/configs/" 2>/dev/null | head -1)"
+              if [ -n "$WHERE" ]; then
+                echo "  OK   $k  (${WHERE#$SRC/})"
+              else
+                echo "  MISS $k —— 血统可疑"; fail=1
+              fi
+            fi
+          done
+          # 这五项只告警：它们在 defconfig 还是 fragment 里 UNVERIFIED，不做硬判据。
+          for k in UNWIND_PATCH_PAC_INTO_SCS SCHED_PROXY_EXEC MODULE_SCMVERSION \
+                   CPUSETS_V1 AUTOFDO_CLANG; do
+            grep -rq "$k" "$SRC/arch/arm64/configs/" 2>/dev/null \
+              || echo "::warning::没找到厂商适配标志 $k（二级判据，仅告警）"
+          done
+          grep -m1 'GKI_TASK_STRUCT_VENDOR_SIZE_MAX' "$SRC/arch/arm64/configs/gki_defconfig" \
+            || echo "::warning::gki_defconfig 里没直接看到 GKI_TASK_STRUCT_VENDOR_SIZE_MAX（期望 1024，AOSP 上游默认 512）"
+          exit $fail
+
+      # ---------------------------------------------------------------- 工具链
+      - name: 工具链 — clang（归档 URL 实测可用）
+        run: |
+          set -eo pipefail            # ★ 不要加 -u
+          GT='https://android.googlesource.com/platform/prebuilts'
+          CLANG_DIR="clang-${CLANG_VERSION}"
+          mkdir -p "$TC/$CLANG_DIR"
+
+          # ★ 坑：build.config.constants 里是 r536225，仓库里的目录名是 clang-r536225。
+          #   归档 URL 与本地解压目录都必须带 clang- 前缀；写成 r536225.tar.gz 会得到
+          #   HTTP 400，而报错信息里没有任何线索指向"少了 clang- 前缀"。
+          echo "--- 可用的 clang 目录（末尾几个）---"
+          curl -fsSL "$GT/clang/host/linux-x86/+/refs/heads/main/?format=JSON" \
+            | sed '1s/^)]}.'"'"'//' | grep -oE '"name": "clang-r[0-9]+"' | sort -u | tail -5
+
+          curl -fsSL --retry 3 -o "$TC/clang.tar.gz" \
+            "$GT/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_DIR}.tar.gz"
+          tar -xzf "$TC/clang.tar.gz" -C "$TC/$CLANG_DIR"
+          rm -f "$TC/clang.tar.gz"
+          echo "$TC/$CLANG_DIR/bin" >> "$GITHUB_PATH"
+          "$TC/$CLANG_DIR/bin/clang" --version
+
+      - name: 工具链 — rust 与 pahole（归档路径 UNVERIFIED，取不到就明确失败）
+        run: |
+          set -eo pipefail            # ★ 不要加 -u
+          GT='https://android.googlesource.com/platform/prebuilts'
+
+          # ---- rust（版本取自 versions.lock [toolchain] rust_version）----
+          # AOSP 的 rust prebuilt 目录名随版本变化过，所以先列目录再把结果打进日志。
+          # 下面这个归档 URL **UNVERIFIED** —— 404 就照日志里的目录名改。
+          echo "--- prebuilts/rust 目录 ---"
+          curl -fsSL "$GT/rust/+/refs/heads/main/?format=JSON" \
+            | sed '1s/^)]}.'"'"'//' | grep -oE '"name": "[^"]+"' | head -20 || true
+          if curl -fsSL --retry 2 -o "$TC/rust.tar.gz" \
+               "$GT/rust/+archive/refs/heads/main/linux-x86/${RUST_VERSION}.tar.gz"; then
+            mkdir -p "$TC/rust" && tar -xzf "$TC/rust.tar.gz" -C "$TC/rust"
+            rm -f "$TC/rust.tar.gz"
+            echo "rust OK ($RUST_VERSION)"
+          else
+            echo "::error::取不到 rust ${RUST_VERSION} —— 归档路径 UNVERIFIED，按上面列出的目录名修正本步骤"
+            exit 1
+          fi
+          for d in "$TC/rust"/*/bin "$TC/rust/bin"; do
+            if [ -x "$d/rustc" ]; then echo "$d" >> "$GITHUB_PATH"; echo "rustc 在 $d"; fi
+          done
+
+          # ---- pahole：必须用 AOSP 的 prebuilt，不能用发行版的 ----
+          # Ubuntu 24.04 自带 pahole 1.25，它给 6.12 生成的 BTF 会被内核自带的
+          # resolve_btfids 以 "FAILED: load BTF from vmlinux: Invalid argument" 拒收。
+          # 本地成功构建里它在 $TC/build-tools/build-tools/bin/pahole；
+          # AOSP 上对应的归档位置 **UNVERIFIED** —— 下面的目录列表就是用来核对它的。
+          echo "--- prebuilts/build-tools 目录 ---"
+          curl -fsSL "$GT/build-tools/+/refs/heads/main/?format=JSON" \
+            | sed '1s/^)]}.'"'"'//' | grep -oE '"name": "[^"]+"' | head -20 || true
+          if [ ! -x "$TC/build-tools/build-tools/bin/pahole" ]; then
+            echo "::warning::$TC/build-tools/build-tools/bin/pahole 不存在 —— 请按上面的目录列表补下载。"
+            echo "::warning::本地实测成功的那份就在这里；缺了它，pahole 检查步骤会明确失败（这是刻意的）。"
+          fi
+          if [ -d "$TC/build-tools/build-tools/bin" ]; then
+            echo "$TC/build-tools/build-tools/bin" >> "$GITHUB_PATH"
+            echo "把 $TC/build-tools/build-tools/bin 放到 PATH 最前面（pahole ★）"
+          fi
+
+      - name: pahole 检查（★ 编之前必须过；不做失败后降级）
+        run: |
+          set -eo pipefail
+          PAHOLE_BIN="$(command -v pahole || true)"
+          echo "pahole 路径 = ${PAHOLE_BIN:-<none>}"
+          echo "pahole 版本 = $(pahole --version 2>/dev/null || echo '<拿不到>')"
+          case "$PAHOLE_BIN" in
+            "$TC"/*) echo "OK: pahole 来自 CI 工具链目录" ;;
+            *)
+              echo "::error::PATH 上的 pahole 不是工具链自带的（${PAHOLE_BIN:-none}）"
+              echo "  症状：编到 LD vmlinux 时 —— FAILED: load BTF from vmlinux: Invalid argument"
+              echo "  根因：pahole 太旧（Ubuntu 24.04 自带 1.25），生成的 BTF 被 resolve_btfids 拒收。"
+              echo "        注意此时整棵树已经编到 LD vmlinux —— 不是树不完整。"
+              echo "  正解：把 AOSP build-tools 的 prebuilt pahole 放到 PATH 最前面。"
+              echo "  错误做法：关掉 CONFIG_DEBUG_INFO_BTF 重编 —— 那会把真正的编译错误一起吞掉。"
+              echo "  （如果你已独立核实手上这份 pahole 不是 1.25，可以放宽本判据；但要保留判据。）"
+              exit 1
+              ;;
+          esac
+          { echo "pahole_path=${PAHOLE_BIN:-none}"; pahole --version 2>&1; } | tee "$TC/toolchain-versions.txt" || true
+
+      # ------------------------------------------------------------------ 构建
+      - name: 生成配置（树自带 gki_defconfig，原样）
+        run: |
+          set -eo pipefail            # ★ 不要加 -u：_setup_env.sh 引用可能未定义的变量
+          cd "$SRC"
+          export ARCH=arm64
+          export BRANCH=android16-6.12
+          export KERNEL_DIR="$PWD"
+          export OUT_DIR="$OUT"
+          export BUILD_CONFIG=build.config.gki.aarch64
+          export LLVM=1 LLVM_IAS=1
+          export SKIP_CP_KERNEL_HDR=1
+
+          # ★ 核心一步：GKI 官方构建入口。它导出 KBUILD_GENDWARFKSYMS_STABLE=1，
+          #   缺它 → gendwarfksyms 走 unstable 路径 → CRC 全错 → 厂商模块拒载。
+          . ./_setup_env.sh
+          echo "KBUILD_GENDWARFKSYMS_STABLE = ${KBUILD_GENDWARFKSYMS_STABLE}"
+          [ "${KBUILD_GENDWARFKSYMS_STABLE}" = "1" ] || {
+            echo "::error::没有 KBUILD_GENDWARFKSYMS_STABLE=1 —— ABI 必然不对"; exit 1; }
+
+          rm -rf "$OUT" && mkdir -p "$OUT"
+          make O="$OUT" ARCH=arm64 LLVM=1 gki_defconfig
+          make O="$OUT" ARCH=arm64 LLVM=1 olddefconfig
+          make O="$OUT" ARCH=arm64 LLVM=1 olddefconfig      # 两轮，让 select 链收敛
+
+      - name: 配置自检（不符就停，不要继续编）
+        run: |
+          set -eo pipefail
+          fail=0
+
+          # ★ 血统在配置层的判据：cctv18 树是 y，AOSP 上游树没有这一项。
+          if grep -qE '^CONFIG_GKI_HACKS_TO_FIX=y' "$OUT/.config"; then
+            echo "OK   CONFIG_GKI_HACKS_TO_FIX=y"
+          else
+            echo "::error::CONFIG_GKI_HACKS_TO_FIX 不是 y —— 血统不对（这就是 cctv18 与 AOSP 上游的分界）"
+            fail=1
+          fi
+
+          for k in GKI_TASK_STRUCT_VENDOR_SIZE_MAX GENDWARFKSYMS MODVERSIONS \
+                   EXTENDED_MODVERSIONS CFI_CLANG SHADOW_CALL_STACK MODULE_SIG_FORCE \
+                   DEBUG_INFO_BTF; do
+            printf '%-40s %s\n' "CONFIG_$k" \
+              "$(grep -E "^(CONFIG_${k}=|# CONFIG_${k} is not set)" "$OUT/.config" || echo '<absent>')"
+          done
+
+          # ★ ftrace 必须是 n：STACK_TRACER 会 select FUNCTION_TRACER，
+          #   让 struct module 从 1600/75 变 1664/77 → msm_drm.ko 拒载 → 卡第一屏。
+          for k in FUNCTION_TRACER STACK_TRACER FUNCTION_GRAPH_TRACER; do
+            if grep -qE "^CONFIG_${k}=y" "$OUT/.config"; then
+              echo "::error::CONFIG_${k}=y —— struct module 会变成 1664/77，立即停"
+              fail=1
+            else
+              echo "OK   CONFIG_${k} 不是 y"
+            fi
+          done
+
+          grep -E '^CONFIG_LOCALVERSION' "$OUT/.config" || true
+          exit $fail
+
+      - name: 编译（失败不降级重编）
+        run: |
+          set -eo pipefail
+          cd "$SRC"
+          make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" 2>&1 | tee "$OUT/../build.log"
+
+      - name: 失败诊断（★ 明确不降级重编）
+        if: failure()
+        run: |
+          LOG="${{ github.workspace }}/build.log"
+          if [ ! -f "$LOG" ]; then echo "(没有 build.log)"; exit 0; fi
+          if grep -q 'load BTF from vmlinux' "$LOG"; then
+            echo "::error::命中已知的 pahole 问题：FAILED: load BTF from vmlinux: Invalid argument"
+            echo "  根因是 pahole 太旧（Ubuntu 24.04 自带 1.25），生成的 BTF 被 resolve_btfids 拒收。"
+            echo "  此时整棵树已经编到 LD vmlinux —— 不是树不完整。"
+            echo "  正解：把 AOSP build-tools 的 prebuilt pahole 放到 PATH 最前面。"
+            echo "  本 workflow 刻意不做「关 CONFIG_DEBUG_INFO_BTF 重编」："
+            echo "  那会把真正的编译错误一起吞掉，换来一个解释不了的绿色构建。"
+          else
+            echo "失败原因不是 BTF。"
+          fi
+          echo "=== 真正的编译错误（前 40 条）==="
+          grep -nE 'error:' "$LOG" | head -40 || true
+          echo "=== build.log 末尾 200 行 ==="
+          tail -200 "$LOG"
+
+      # -------------------------------------------------------------- ABI 第①项
+      - name: ABI 校验第①项：Module.symvers vs gki/aarch64/abi.stg
+        run: |
+          set -eo pipefail
+          SYMVERS="$OUT/Module.symvers"
+          ABISTG="$SRC/gki/aarch64/abi.stg"
+          [ -f "$SYMVERS" ] || { echo "::error::没有 $SYMVERS"; exit 1; }
+          [ -f "$ABISTG" ]  || { echo "::error::树里没有 gki/aarch64/abi.stg"; exit 1; }
+
+          echo "我们的导出符号行数 : $(grep -c . "$SYMVERS")"
+          echo "基线 crc 条目数    : $(grep -c 'crc:' "$ABISTG")   （实测基线 ${ABI_BASELINE_SYMBOLS}）"
+
+          python3 - "$SYMVERS" "$ABISTG" "$ABI_BASELINE_SYMBOLS" <<'PY' | tee "${{ github.workspace }}/abi-check.txt"
+          import re, sys
+
+          symvers, abistg, expected = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+          def norm(s):
+              s = s.strip().strip('"')
+              if s[:2].lower() == '0x':
+                  s = s[2:]
+              # ★ 归一化陷阱："0xaebcaf80".lstrip('0') -> "xaebcaf80"（100% 假 DIFF）
+              return s.lstrip('0').lower() or '0'
+
+          # Module.symvers 每行：<crc>\t<name>\t<module>\t<export>
+          ours = {}
+          for line in open(symvers, errors='replace'):
+              p = line.split()
+              if len(p) >= 2:
+                  ours[p[1]] = norm(p[0])
+
+          text = open(abistg, errors='replace').read()
+
+          # 基线：优先按 elf_symbol { ... } 分块解析
+          base = {}
+          for block in re.findall(r'elf_symbol\s*\{(.*?)\n\s*\}', text, re.S):
+              n = re.search(r'name\s*[:=]\s*"?([A-Za-z_][A-Za-z0-9_.$]*)"?', block)
+              c = re.search(r'\bcrc\s*[:=]\s*"?([0-9a-fA-Fx]+)"?', block)
+              if n and c:
+                  base[n.group(1)] = norm(c.group(1))
+
+          # 兜底：不分块，按出现顺序把 name 与紧随其后的 crc 配对
+          if not base:
+              cur = None
+              for m in re.finditer(r'\bname\s*[:=]\s*"?([A-Za-z_][A-Za-z0-9_.$]*)"?'
+                                   r'|\bcrc\s*[:=]\s*"?([0-9a-fA-Fx]+)"?', text):
+                  if m.group(1):
+                      cur = m.group(1)
+                  elif m.group(2) and cur:
+                      base[cur] = norm(m.group(2))
+                      cur = None
+
+          # ★ 闸门：解析不出来就拒答，绝不给出一个假的 DIFF。
+          if len(base) != expected:
+              print(f"ABORT: 从 abi.stg 解析出 {len(base)} 个符号，预期 {expected}")
+              print("       解析器与这份 abi.stg 的方言不匹配（本脚本 UNVERIFIED）。")
+              print("       先核对: grep -c 'crc:' <abi.stg>  与  grep -c 'elf_symbol' <abi.stg>")
+              print("       修正解析器之前，不要相信任何 DIFF。")
+              sys.exit(2)
+
+          match = diff = missing = 0
+          bad = []
+          for name, b in base.items():
+              o = ours.get(name)
+              if o is None:
+                  missing += 1
+              elif o == b:
+                  match += 1
+              else:
+                  diff += 1
+                  if len(bad) < 20:
+                      bad.append(f"  DIFF {name}: ours=0x{o} baseline=0x{b}")
+
+          print(f"our exported     : {len(ours)}")
+          print(f"baseline symbols : {len(base)}")
+          print(f"MATCH            : {match}")
+          print(f"DIFF             : {diff}")
+          print(f"MISSING          : {missing}")
+          for b in bad:
+              print(b)
+
+          if diff:
+              print("VERDICT: ABI ① FAILED —— 判据是 DIFF == 0")
+              sys.exit(1)
+          print("VERDICT: ABI ① OK (DIFF=0)")
+          PY
+
+      # ---------------------------------------------------------------- 证据
+      - name: 收集证据并生成 md5
+        # ★ 校验和口径是 md5，**不是 sha256**：内核工程仓里交付镜像只有 md5
+        #   （versions.lock 的 image_md5 / package_md5）。唯一的 sha256 出现在
+        #   历史 CI 产物记录里，是那一次自加的口径，不是本仓口径。
+        # ★ CI 产物的 md5 不会等于交付镜像的 md5（署名/路径/时间不同）。
+        #   它是本次构建的自证指纹，不是拿去做交付比对的常量。
+        if: always()
+        run: |
+          set -eo pipefail
+          mkdir -p dist release
+          for f in arch/arm64/boot/Image System.map .config Module.symvers vmlinux; do
+            if [ -e "$OUT/$f" ]; then cp -v "$OUT/$f" dist/; fi
+          done
+          cp -v "${{ github.workspace }}/build.log" dist/ 2>/dev/null || true
+          cp -v "${{ github.workspace }}/abi-check.txt" dist/ 2>/dev/null || true
+          ( cd dist && md5sum * > MD5SUMS && ls -la && cat MD5SUMS )
+          cp -v dist/* release/ 2>/dev/null || true
+
+      - name: 结论（只写它真的证明了的）
+        if: always()
+        run: |
+          {
+            echo "== kernel-lineage-abi-check =="
+            echo "run        : ${{ github.run_id }} / ${{ github.run_number }}"
+            echo "upstream   : ${UPSTREAM_URL} @ ${UPSTREAM_BRANCH}"
+            echo "commit     : ${EXPECTED_COMMIT:-?}"
+            echo "clang      : ${CLANG_VERSION}"
+            echo "rust       : ${RUST_VERSION}"
+            echo "pahole     : $(pahole --version 2>/dev/null || echo '<none>')"
+            IMG="$OUT/arch/arm64/boot/Image"
+            if [ -e "$IMG" ]; then
+              echo "Image      : $(stat -c%s "$IMG") bytes"
+              echo "Image md5  : $(md5sum "$IMG" | cut -d' ' -f1)"
+              echo "kernelrelease: $(make -s -C "$SRC" O="$OUT" ARCH=arm64 LLVM=1 kernelrelease 2>/dev/null || echo '?')"
+            else
+              echo "Image      : <没有产出>"
+            fi
+            echo
+            echo "本 workflow 证明的  : 血统 / 能在干净机器上编过 / ABI 第①项 DIFF=0"
+            echo "本 workflow 不证明的: 内核能开机（唯一证明方式是真机刷入）；"
+            echo "                     也不产出可刷内核 —— 不要拿这里的产物去 fastboot flash"
+            echo
+            echo "参考判据（ABI 四重）: ① DIFF=0（本 workflow） ② msm_drm.ko DIFF=0"
+            echo "                     ③ struct module 1600/75  ④ kobject_uevent_env 0x8bb6d45c"
+          } | tee "${{ github.workspace }}/VERDICT.txt"
+
+      - name: 上传证据（artifact，供桌面侧取用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-lineage-abi-${{ github.run_number }}
+          path: |
+            dist
+            VERDICT.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 可选：发到 Release（手机侧用匿名直链取回）
+        # 手机侧的现实：artifact 需要登录，而登录页在 github.com —— 恰好是常被墙的一侧。
+        # Release asset 的匿名直链才是手机能直接 curl 的路径：
+        #   https://github.com/<owner>/<repo>/releases/download/<tag>/<file>
+        if: ${{ always() && inputs.release_tag != '' && hashFiles('release/*') != '' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}
-          name: "kernel ${{ inputs.target }}-${{ inputs.variant }} (${{ github.run_number }})"
+          name: "lineage + ABI① evidence (run ${{ github.run_number }})"
           body: |
-            由 GitHub Actions 构建。
+            **这不是可刷内核**，是「血统自检 + 编译期冒烟测试 + ABI 第①项」的证据。
 
-            核实方式：下载后先比 `SHA256SUMS`，再按 `safe-kernel-flash` 的清单刷入。
-            构建目标：`${{ inputs.target }}-${{ inputs.variant }}`
+            上游：`${{ env.UPSTREAM_URL }}` @ `${{ env.UPSTREAM_BRANCH }}`
+            commit：见 `VERDICT.txt` 与本仓 `versions.lock`
+            工具链：clang `${{ env.CLANG_VERSION }}` / rust `${{ env.RUST_VERSION }}`
+            ABI 第①项判据：DIFF = 0（基线 `${{ env.ABI_BASELINE_SYMBOLS }}` 个符号）
+
+            校验和口径是 **md5**（见 `MD5SUMS`），不是 sha256。
+            下载后先比 `MD5SUMS`；**不要**拿它去刷机 —— 能不能开机只能由真机刷入证明。
           files: release/*
+          fail_on_unmatched_files: false
           make_latest: false
+
+# =============================================================================
+# UNVERIFIED / UNKNOWN（诚实清单 —— 不要把没测过的东西说成测过的）
+#
+#   UNVERIFIED
+#     * 这套流程在 GitHub runner 上跑过一次完整成功（本地实测成功 ≠ CI 实测成功）。
+#     * rust 1.82.0.p2 与 build-tools/pahole 的 AOSP 归档 URL。
+#       （clang-r536225 的 gitiles 归档地址是实测可用的。）
+#     * 内联的 abi.stg 解析脚本对这份文件方言的适配 —— 所以脚本里带
+#       「解析出的符号数不等于 ABI_BASELINE_SYMBOLS 就 sys.exit(2)」的闸门。
+#
+#   UNKNOWN
+#     * CI 上的真实耗时与峰值磁盘占用。
+#     * CI 产物的 md5 在各次运行之间是否稳定。
+#     * cctv18 树的 SPL（内核安全补丁日期）是否不旧于设备。
+# =============================================================================

@@ -5,18 +5,43 @@
 #       这个 workflow 不产出可用内核，只回答一个问题：
 #       clone → gki_defconfig → make Image 这条链在干净机器上走不走得通。
 #
+# ⚠️ 最重要的一条结论（2026-10-08 之后才知道）：
+#   **它能编出 Image，但那个 Image 在小米 17 上开不了机。**
+#   真机上连续三次刷机失败（卡在开机第一屏、无 panic、无内核日志），
+#   直到把源码树从 aosp-mirror/kernel_common 换成有小米/高通适配层的
+#   厂商血统树（cctv18/android_gki_kernel_common）才开机成功——
+#   而那一次**连 ABI 都没有比失败的那次更对齐**（两边都是 DIFF 0）。
+#
+#   所以这个 workflow 现在的定位是**证据，不是产线**：
+#   它证明的是「CI 管线本身是通的、这棵树是完整的」，
+#   而不是「这样编出来的内核能用」。不要拿它的产物去刷机。
+#
+#   详见 README.md「必须最先知道的三个现实」与 skill `gki-abi-verification`。
+#
+# ⚠️ 本文件里有一处**故意保留的反面样本**，不要复制到任何新 workflow：
+#   第 187 行附近在 `FAILED: load BTF from vmlinux: Invalid argument` 之后
+#   自动 `-d DEBUG_INFO_BTF` 然后重编。那是为了回答「这条链走不走得通」而做的
+#   一次性权宜之计。正确做法是**编之前**就把 AOSP build-tools 的 prebuilt pahole
+#   放到 PATH 最前面；绝不要靠关 BTF 去绕过它 —— 那会掩盖真实的编译错误。
+#   新的 workflow 见 skill `kernel-build-ci-actions` 的 `references/build-kernel.yml`。
+#
 # 为什么需要它：skill 里写的配方如果没有被真正执行过一次，就只是猜测。
 #       本仓库宁可把「未验证」标出来，也不要写一个看起来完整却没人跑过的流程。
 #
 # 只支持手动触发（workflow_dispatch），不会自动跑，不消耗你的日常额度。
 #
-# 已知事实（前三轮实测）：
+# 已知事实（三轮实测）：
 #   * android16-6.12 = 6.12.52-4k-g105b5745f1d7，72,991 条路径，关键文件齐全，
 #     `make gki_defconfig` 可用 —— 这棵树确实能编，和厂商那棵 2,686 条路径的完全两回事。
 #   * gki_defconfig 里已经是：ZRAM=m、ZRAM_MULTI_COMP=y、F2FS_FS_COMPRESSION=y、
 #     SCHED_CLASS_EXT=y、CFI_CLANG=y、MODVERSIONS=y、DEBUG_INFO_BTF=y；
 #     LTO 在 defconfig 里没有，由 AOSP 的 build.config 用 make 参数打开。
-#   * 唯一会挂的地方是 BTF（见「构建 Image」步骤的注释）。
+#   * host 依赖里有一个反直觉的必装项：libdw-dev（否则 gendwarfksyms 找不到 dwarf.h）。
+#   * BTF 步骤在发行版自带的 pahole 1.25 上会挂，本 workflow 会**只在精确命中该报错时**
+#     自动关掉 DEBUG_INFO_BTF 重试一次（见「构建 Image」步骤）。这是权宜之计：
+#     它不是 kernel 该有的做法，正确的做法是用 AOSP build-tools 的 prebuilt pahole
+#     （见 skill `android-kernel-build-on-device`）。之所以保留这个降级，
+#     是因为本 workflow 的目的就是回答「这条链走不走得通」，不是产出内核。
 #
 # 预期耗时：4 vCPU 上约 25–40 分钟。
 # 预期产物体积：out/ 约 15–25 GB，所以磁盘清理是必需的。

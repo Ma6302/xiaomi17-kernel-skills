@@ -56,7 +56,19 @@ if [ "$MODE" != "adb" ]; then
 		} >&2
 		exit 3
 	fi
-	if [ ! -d /dev/block/by-name ]; then
+	# Windows 上的 MSYS / Git bash 也不是 Android shell：那里没有 /sdcard，没有
+# /dev/block，getprop 也多半是别的东西。与 proot 同理 —— 它会「成功地」写出一份
+# 放在电脑上的、对着虚构路径采出来的档案。所以这里也直接停下。
+case "$(uname -s 2>/dev/null)" in
+MINGW*|MSYS*|CYGWIN*)
+	echo "环境错误：uname -s 报的是 $(uname -s)，这是 Windows 上的 MSYS/Git bash，不是 Android shell。" >&2
+	echo "  /sdcard、/dev/block/by-name、/proc/bootconfig 在这里都不存在 —— 采出来的只会是空档案。" >&2
+	echo "  请在手机上（Operit 的 Shizuku / Root 终端）跑，或用电脑侧的 --adb 模式：" >&2
+	echo "    bash scripts/collect-device-facts.sh --adb" >&2
+	exit 3
+	;;
+esac
+if [ ! -d /dev/block/by-name ]; then
 		echo "警告：看不到 /dev/block/by-name —— 分区清单与存在性判断会全部为空。" >&2
 		echo "  不致命，但请人工补齐，不要当成「这台设备没有分区」。" >&2
 	fi
@@ -93,6 +105,27 @@ p_kmi_prop=$(first "$(prop ro.boot.kmi)")
 p_api=$(first "$(prop ro.vendor.api_level)")
 
 krel=$(first "$(run uname -r)")
+
+# --- boot_index：这是哪一次开机 -------------------------------------------------
+# 刷机与失败排查中最可靠的「现在跑的到底是哪一轮」标记。它是 bootloader 每启动一次
+# 就加一的计数器，写在 cmdline 里；getprop 会被隐藏模块伪造（见下），这个不会。
+# 第五个关键标识：设备 / KMI / 槽位 / 内核 release / boot_index。
+#
+# 实测序列（2026-10-08，小米 17，同一台设备连续刷写）：
+#   原厂 357 → V1 354 → V2 356 → 修复版 361/362 → 成功版 365 → zstd/lz4 367 → mi_sched 372
+# 每次刷机前后各记一次。刷完 boot 而 boot_index 没变 = 刷写没生效，
+# **不能**据此说「新内核启动了但没跑起来」。
+#
+# 三种取值语义不同，不要混：
+#   数字    = 读到了
+#   NONE    = /proc/cmdline 读得到，但里面没有 boot_index=（设备差异，不是错误）
+#   UNKNOWN = 连 /proc/cmdline 都读不到（采集通道问题，必须停下）
+cmdline=$(first "$(run "cat /proc/cmdline")")
+boot_index=$(printf '%s' "$cmdline" | grep -o 'boot_index=[0-9]*' | head -n1 | sed -n 's/^boot_index=//p')
+if [ -z "$boot_index" ] && [ -n "$cmdline" ]; then
+	boot_index="NONE"
+fi
+[ -n "$boot_index" ] || boot_index="$UNKNOWN"
 
 # --- KMI 世代：三个来源，只信 uname -r 是不够的 ------------------------------
 # KMI 世代决定你该编/刷哪个 GKI 分支，也决定 vendor 的预编译模块认不认你的新内核。
@@ -229,6 +262,25 @@ fi
 # 有 su 但认不出管理器时不要谎报 none —— "未知"和"没有"是两件事。
 [ "$root_mode" = "none" ] && command -v su >/dev/null 2>&1 && root_mode="manager-unknown"
 
+# --- root 实现的确证（只读） ----------------------------------------------------
+# ROOT_MODE 只说了「属于哪一种方案」，本身还不是确证。两个只读命令能把实现钉死：
+#   id       -> context=u:r:ksu:s0            （KernelSU 的特征 SELinux 域）
+#   ksud -V  -> 4.2.0-1-g904c60d1 (uapi: 2)
+# 实测病例（2026-10-08，小米 17）：root_mode=kernelsu-lkm，补丁在 init_boot；
+# 只刷 boot 不会掉 root（boot_index 365 与 372 两轮均如此，实测两次）。
+# 反面教训：ksud boot-restore 会因 stock_image.sha1 与当前镜像不匹配而拒绝工作 ——
+# 它不是回滚路径。回滚只有一条：在电脑上 fastboot flash boot_a <原厂 boot.img>。
+root_context=$(first "$(run 'id' | tr ',' '\n' | sed -n 's/.*context=//p')")
+[ -n "$root_context" ] || root_context="$UNKNOWN"
+ksud_version=""
+case "$root_mode" in
+kernelsu-*)
+	ksud_version=$(first "$(run 'ksud -V')")
+	[ -n "$ksud_version" ] || ksud_version=$(first "$(run '/data/adb/ksud -V')")
+	;;
+esac
+[ -n "$ksud_version" ] || ksud_version="(非 KernelSU，或无 ksud)"
+
 # 补丁落在哪个分区：GKI 布局下内核在 boot、通用 ramdisk 在 init_boot。
 # 只有管理器界面显示的"修补目标"才是权威答案，这里给的是最可能的推断。
 root_partition="$UNKNOWN"
@@ -318,6 +370,7 @@ SECURITY_PATCH=$p_spl
 VENDOR_SECURITY_PATCH=$p_vspl
 BUILD_DISPLAY_ID=$p_display
 KERNEL_RELEASE=$krel
+BOOT_INDEX=$boot_index
 KMI_GENERATION=$kmi_gen
 KMI_SOURCE="$kmi_src"
 KMI_FROM_VERMAGIC=$kmi_vermagic
@@ -337,6 +390,8 @@ VERITY_MODE=$p_verity
 ANTI_ROLLBACK_INDEX=$p_anti
 ROOT_MODE=$root_mode
 ROOT_PARTITION=$root_partition
+ROOT_CONTEXT="$root_context"
+KSUD_VERSION="$ksud_version"
 VENDOR_API_LEVEL=$p_api
 HAS_BOOT=$has_boot
 HAS_INIT_BOOT=$has_init_boot
@@ -364,6 +419,7 @@ EOF
 	echo "| 安全补丁 | \`$p_spl\` / vendor \`$p_vspl\` | \`ro.*.build.security_patch\` |"
 	echo "| 当前 ROM | \`$p_display\` | \`ro.build.display.id\` |"
 	echo "| 内核 release | \`$krel\` | \`uname -r\` |"
+	echo "| **boot_index（哪一次开机）** | \`$boot_index\` | \`grep -o 'boot_index=[0-9]*' /proc/cmdline\`（NONE = 设备无此标记） |"
 	echo "| KMI 世代 | \`$kmi_gen\` | $kmi_src |"
 	echo "| KMI 来源三值 | vermagic=\`$kmi_vermagic\` / uname=\`$kmi_uname\` / prop=\`$p_kmi_prop\` | 三者矛盾时取 vermagic |"
 	echo "| 内核主线 | \`$kmi_line\` | 由 uname -r 解析 |"
@@ -373,6 +429,7 @@ EOF
 	echo "| verity 模式 | \`$p_verity\` | \`ro.boot.veritymode\` |"
 	echo "| ARB 指数 | \`${p_anti:-$UNKNOWN}\` | \`ro.boot.anti\`（常为空，见下） |"
 	echo "| 现有 root | \`$root_mode\` | \`/data/adb\`、\`su -v\`、\`ksud\`、\`/proc/config.gz\` |"
+	echo "| root 实现确证 | SELinux context=\`$root_context\`，ksud=\`$ksud_version\` | \`id\`、\`ksud -V\` |"
 	echo "| root 补丁所在分区 | \`$root_partition\` | 分区存在性 + 管理器修补目标 |"
 	echo "| vendor API level | \`$p_api\` | \`ro.vendor.api_level\` |"
 	echo
@@ -461,12 +518,41 @@ EOF
 	echo "fastboot getvar anti"
 	echo '```'
 	echo
+	echo "## boot_index 与日志归属"
+	echo
+	echo "本次开机 \`boot_index=$boot_index\`（来自 \`/proc/cmdline\`）。它是 bootloader 每启动一次就加一的计数器，"
+	echo "也是失败排查时唯一可靠的「现在跑的是哪一轮」。**刷机前后各记一次**：刷完 boot 而它没变，"
+	echo "说明刷写没生效，不能读成「新内核启动了但没跑起来」。"
+	echo
+	if [ "$boot_index" = "NONE" ]; then
+		echo "本设备的 cmdline 里没有这个标记（NONE）。这是设备差异，不是错误 —— 但轮次锚点缺失后，"
+		echo "归属判定只能退回到版本串与署名（见下）。"
+		echo
+	fi
+	echo "**读取任何取证分区或内核日志之前，先判归属。** 用本轮独有的串确认这段日志出自哪一轮："
+	echo
+	echo '```'
+	echo "grep -c '<你的署名后缀>' <log>    # 本轮的 CONFIG_LOCALVERSION 署名"
+	echo "grep -c '6.12.93' <log>           # 整段零匹配 = 不是本轮"
+	echo "grep -o 'boot_index=[0-9]*' <log>"
+	echo '```'
+	echo
+	echo "判据必须是本轮独有的串。看到 \`Linux version 6.12\` 就认领，是最经典的一次误判："
+	echo "\`<你的署名后缀>\` 是每个构建者自己取的 \`CONFIG_LOCALVERSION\` 后缀，也是内核身份守卫认自己内核的判据 —— 不要照抄别人的。"
+	echo "实测病例中，blackbox 里一段「正常启动」的日志其实属于**刷机前的另一个内核**，"
+	echo "只是被本轮的 bootmonitor 归档了 —— 整段 \`<你的署名后缀>\` 零匹配、\`6.12.93\` 零匹配。"
+	echo "拿它去解释本轮的卡死，排查方向从一开始就是错的。"
+	echo
+	echo "**mtdoops 的坑**：它写的是「本轮内核**正常关机**时」的本轮日志。卡死的轮次没有关机路径，"
+	echo "永远不会落盘。所以「oops 分区里没有我的记录」**不能**推出「内核没跑起来」；"
+	echo "反过来，分区里存在的记录也可能属于别的健康轮次。"
+	echo
 	echo "## 结论"
 	echo
-	if [ "$p_device" = "$UNKNOWN" ] || [ "$kmi_gen" = "$UNKNOWN" ]; then
-		echo "**BLOCKED**：device 或 KMI 世代仍是 UNKNOWN。在补齐之前不要开始编译，更不要刷写。"
+	if [ "$p_device" = "$UNKNOWN" ] || [ "$kmi_gen" = "$UNKNOWN" ] || [ "$boot_index" = "$UNKNOWN" ]; then
+		echo "**BLOCKED**：device、KMI 世代或 boot_index 仍是 UNKNOWN。在补齐之前不要开始编译，更不要刷写。"
 	else
-		echo "**READY**：device=\`$p_device\`，kmi=\`$kmi_gen\`，slot=\`$p_slot\`，内核=\`$krel\`。"
+		echo "**READY**：device=\`$p_device\`，kmi=\`$kmi_gen\`，slot=\`$p_slot\`，boot_index=\`$boot_index\`，内核=\`$krel\`。"
 	fi
 } > "$OUT_DIR/device-profile.md"
 
@@ -488,10 +574,11 @@ missing=""
 [ "$p_device" = "$UNKNOWN" ]     && missing="$missing DEVICE"
 [ "$krel" = "$UNKNOWN" ]         && missing="$missing KERNEL_RELEASE"
 [ "$kmi_gen" = "$UNKNOWN" ]      && missing="$missing KMI_GENERATION"
+[ "$boot_index" = "$UNKNOWN" ]   && missing="$missing BOOT_INDEX"
 [ "$flash_locked" = "$UNKNOWN" ] && missing="$missing FLASH_LOCKED"
 [ "$p_verity" = "$UNKNOWN" ]     && missing="$missing VERITY_MODE"
 
-if [ "$p_device" = "$UNKNOWN" ] || [ "$kmi_gen" = "$UNKNOWN" ]; then
+if [ "$p_device" = "$UNKNOWN" ] || [ "$kmi_gen" = "$UNKNOWN" ] || [ "$boot_index" = "$UNKNOWN" ]; then
 	[ -n "$missing" ] && echo "REQUIRED 字段缺：$missing" >&2
 	echo "脚本跑完了，但这不是一份可以往下走的档案。先补齐上面这些。" >&2
 	exit 3

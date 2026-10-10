@@ -1,153 +1,289 @@
 ---
 name: safe-kernel-flash
-description: 用于在 Android 手机上安全刷入自编译内核并保留可回滚路径，包括刷前检查、备份 root 补丁所在的分区（GKI 设备上常是 init_boot 而不是 boot）、在机内用 dd 直接写入或用 fastboot 写入、判断是否需要动 vbmeta、以及刷不开机时的恢复阶梯。当要刷写内核镜像或 AnyKernel3 包、需要回滚到原厂内核、或刷完无法开机时使用。
+description: 用于在小米 17（pudding / canoe / SM8850 / Android 17 / KMI android16-6-4k）上刷入自编译 GKI 内核或 AnyKernel3 包，以及判断刷完到底成没成、卡住了还能不能退回来。当要往 boot_a 写内核、刷完卡在 XBL 第一屏（静默、无声音、无振动、不自动重启）、或一分多钟后屏幕下缘闪一下自动重启循环、需要长按音量下加电源进 fastboot 刷回 stock-boot.img、想搞清楚 PSHOLD 复位为什么让 printk 与 ramoops 一起消失、分不清 getprop 与 /proc/bootconfig 哪个是真值、或拿不准 ARB 与 flash_all 的风险时使用。
 ---
 
 # 安全刷入内核
 
 ## Overview
 
-刷内核的风险不在「写入」这一步，而在**「写入之后你还有没有别的路可走」**。所以判据不是「包对不对」，而是：
+一句话命题：
+
+> **刷机前的每一分钟都在为回滚做准备；刷机后的唯一目标是证明它真的成功了。**
+
+刷内核的风险不在 `fastboot flash` 那一步——那一步几乎不会失败。风险在写完之后：**你还有没有第二条路。**
+
+所以判据不是「包对不对」，而是：
 
 > 如果现在这块屏幕再也不亮了，我下一句话能说什么？
 
-能说出「另一槽是原厂」或「备份在原厂 boot 已在机外」，才算准备好了。
+答得出「PC 上有 `stock-boot.img`，md5 是 `5157f9020b45b51ec1701c79cda9b93d`，我能在 fastboot 里单刷 `boot_a`」，才算准备好了。
+
+这台机器（小米 17 / 代号 `pudding` / 平台 `canoe` / 高通 SM8850 / Linux 6.12 GKI / Android 17 / KMI `android16-6-4k`）已经用**三次失败刷机**把这条判据验证过：三次都卡在 XBL 第一屏，其中**两次**是靠**刷机前就拷到 PC 上的镜像**手动救回来的。**回滚路径不存在就不许开刷**——这是硬闸门，不是建议。
+
+**REQUIRED SUB-SKILL:** `xiaomi17-device-recon` —— 本 skill 依赖它的 `device-profile.md` / `build.env`（`ROOT_PARTITION`、`SLOT`、`FLASH_LOCKED`）。档案不存在就先采集，不要在这里重新猜。
 
 ## When to Use
 
-- 要刷入刚打包好的内核 / AK3 zip。
-- 刷完不开机、卡 fastboot、卡 recovery、反复重启。
-- 要回滚到原厂内核。
-- 不确定该不该动 vbmeta。
+**命中任意一条就来这里：**
 
-**何时不用**：包还没检查过（先跑 `anykernel3-packaging` 的 `check-anykernel-zip.sh`）。
+- 刷完后卡在开机第一屏（XBL splash logo），**无声音、无振动、不自动重启**。
+- 或一分多钟后屏幕下缘闪一下 → 自动重启 → 屏幕下缘再闪 → 循环。
+- 刷完 `uname -r` 没变；或变了但 `dmesg` 里一堆 `Unknown symbol` / `disagrees about version`。
+- 刷完 root 没了（`/data/adb/ksud -V` 报错）。
+- 想拿内核日志，却发现 printk / ramoops 里什么都没有。
+- 要回滚到原厂或上一个能开机的内核，但不确定镜像在哪、该刷哪个分区。
+- 准备开刷之前，要判断「现在退路存在吗」。
 
-## 第一步：机械检查，不要靠感觉
+**何时不用**
+
+- 包还没检查过结构 → 先去 `anykernel3-packaging` 跑 `check-anykernel-zip.sh`。
+- 设备事实还没采集（不知道 `ROOT_PARTITION`）→ 先去 `xiaomi17-device-recon`。
+- 内核还没编出来 → `android-kernel-build-on-device`。
+- 只是问概念、不碰真机。
+
+## 四个硬闸门（缺一个就不许开刷）
+
+### 闸门 1：回滚镜像已经在 PC 上，且 md5 逐字匹配
+
+**fastboot 阶段读不到手机内部存储。** 手机里的备份在那一刻等于不存在。镜像必须在**刷机之前**就躺在 PC 上。
 
 ```bash
-bash scripts/preflight-flash.sh --zip /sdcard/Download/Operit/kernel-dev/out/xxx.zip
+md5sum stock-boot.img
+# 期望: 5157f9020b45b51ec1701c79cda9b93d   ← 真原厂 6.12.69，首选回滚镜像
 ```
 
-它检查代号、槽位、电量、分区、**备份是否存在且校验和通过**、包是否完整。任何阻塞项都会以 exit 3 结束。
+三个备份（md5 逐字，实测采集）：
 
-## 第二步：备份（这是唯一真正的保险）
+| 文件 | md5 | 说明 |
+| --- | --- | --- |
+| `stock-boot.img` | `5157f9020b45b51ec1701c79cda9b93d` | 真原厂 6.12.69，**首选回滚镜像** |
+| `boot_a.img` | `5329fec9e9c154913673065734662067` | Jianke 6.12.111 备份，备用 |
+| `init_boot_a.img` | `f78cdace08393da6272c658f2e1cc66e` | KSU 补丁所在分区 |
+
+md5 对不上 = 你手上的不是那个镜像。**不要刷。** 名字对不等于内容对。
+
+### 闸门 2：`ROOT_PARTITION` 已经备份，而且你知道它在哪个分区
+
+GKI 布局里**内核在 `boot`，通用 ramdisk 在 `init_boot`**。KernelSU 的 LKM 模式把 `kernelsu.ko` 打进 ramdisk，所以 root 补丁在 **`init_boot`**：
+
+```
+init_boot_a.img 内的 ramdisk:
+  init                     607 KB   ← SukiSU wrapper（替换了原 init）
+  init.real               2.81 MB
+  kernelsu.ko              390 KB
+  stock_image.sha1          40 B
+```
+
+实测结论（`boot_index` 365 之后）：**不内置 KSU、只替换 `boot` 里的 `Image` → root 完好。**
+
+所以：
+
+- **`init_boot` 不要动。** 刷它才会掉 root，而刷我们的内核不需要它。
+- 但**必须备份它**——它是你唯一能整回去的东西。
+- 「只备份 `boot`」是最常见的假备份：开机时看着有备份，真出事时发现里面没有你唯一想要的那部分。
+
+### 闸门 3：只刷 `boot_a`，一个字节都不往别处写
+
+实测分区（本机字节，逐字）：
+
+```
+boot_a        → /dev/block/sde14    100,663,296 B (96 MB)
+init_boot_a   → /dev/block/sde30      8,388,608 B (8 MB)   ← 不要动
+vendor_boot_a → /dev/block/sde25    100,663,296 B
+dtbo_a        → /dev/block/sde18     33,554,432 B (32 MB)
+```
+
+我们的 `Image` 约 41,899,648 字节（实测 41,896,448），`boot_a` 有 96 MB，空间充足。
+
+boot 头是 **header v4**，`ramdisk_size = 0`（ramdisk-less 设备）→ AnyKernel3 走 `flash_boot` 分支（不是 `write_boot`）。
+
+绝对不动：`vbmeta` / `init_boot` / `persist` / `modemst1` / `modemst2` / `frp` / `misc`，也不重锁 BL。
+
+**不要双写两个槽。**「另一槽还能开机」是免费的保险；`SLOT_SELECT=both` 会把它一次花光。
+
+### 闸门 4：绝不 `flash_all` —— 它会触发 ARB，而且不可逆
 
 ```bash
-bash ../xiaomi17-device-recon/scripts/collect-device-facts.sh --backup
+# 绝不要执行任何形式的整包刷写：
+fastboot flash_all            # ✗ 触发 ARB
+# 也不要跑官方包里的 flash_all.sh / flash_all.bat / 任何整包脚本
 ```
 
-备份必须满足**四条**，缺一条就等于没有备份：
+**ARB（anti-rollback）保护的是 bootloader 与固件链（xbl / abl / tz / hyp / devcfg），不是内核。** 单刷 `boot` / `init_boot` / `vendor_boot` / `dtbo` / `vbmeta` 不涉及 ARB 计数。
 
-1. **包含 root 补丁所在的那个分区。** `device-profile.md` 里的 `ROOT_PARTITION` 就是答案 —— 在 GKI 设备上它常常是 `init_boot` 而不是 `boot`（内核在 `boot`，通用 ramdisk 在 `init_boot`）。**只备份 `boot` 而 root 在 `init_boot`，是最常见的假备份**：开机时看着有备份，真出事时发现里面没有你唯一想要的东西。
-2. **落在机外**（电脑、U 盘、云盘）。存在同一个 /data 里，设备一旦进不了系统你取不出来。
-3. **有 SHA256 并且校验通过**。一个静默损坏的备份和被刷坏的设备一样无可挽回。
-4. **包含 vbmeta**。忘了它，后面想动 verity 时就没有退路。
-5. **清楚备份到的是不是原厂镜像。** 如果 `device-profile.md` 说当前内核**不是**原厂 GKI 构建（`uname -r` 里没有 `androidNN` 标记），那么 `dd` 出来的 `boot` 只是**上一个第三方内核**，不是原厂。它能带你回到「上一个能开机的状态」，回不到出厂。要真正的原厂退路，得从与当前 ROM 版本、ARB 指数都一致的官方 fastboot ROM 里取 `boot.img` / `init_boot.img`。
-
-## 第三步：理解 ARB 到底管什么
-
-**ARB 保护的是 bootloader 与固件链（xbl / abl / tz / hyp / devcfg 等），不是内核。**
-
-只刷 `boot` / `init_boot` / `vendor_boot` / `dtbo` / `vbmeta` **不会触发 ARB**。
-
-真正会触发 ARB 的是刷**整包 fastboot 固件**或整包 ROM：当固件包里的 ARB 版本低于设备已熔断的版本，设备拒绝启动，**且不可逆**。
-
-**查当前 ARB 状态**：
+**本机 ARB 指数：`UNKNOWN`。** 机内 `ro.boot.anti` 是空的，**空 ≠ 没有 ARB**。要确定必须在 fastboot 里查：
 
 ```bash
 fastboot getvar anti
-# 输出为空  → ARB 尚未启用
-# 输出一个数字 → 这就是当前的 rollback index
 ```
 
-规则：镜像的 index **大于**设备 → 刷入成功，且设备 index **被提升到与该镜像一致**；**等于** → 不变；**更小** → 拒绝刷入（MiFlash 会报 anti-rollback 错误）。
+侧面证据（blackbox 分区实测）：`the stored_rollback_index is: 1`，在 `boot_index` 361 / 362 / 364 多轮中保持一致、未见变化——但刷 `boot` 本身不涉及 ARB 计数，所以这不能当成「ARB 很安全」的结论。
 
-注意两件事：
+**按高危处理**：不要刷任何比你当前版本旧的官方整包，不要拿降级当回滚手段。
 
-- **`ro.boot.veritymode` 不是 ARB。** 那个属性反映的是 AVB/dm-verity 状态，和防回滚是两回事。
-- 小米的 ARB **不能像 Google 那样通过解锁 BL 关掉**。一旦装上带更高 ARB 版本的固件，就回不去了。
+## 刷前检查清单
 
-由此得到一条操作纪律：
-
-> 回滚原厂时，**只从官方包里取出 boot / init_boot / vbmeta 单刷**，
-> 绝不图省事跑整包的 `flash_all` 之类脚本。
-
-这条纪律同时解释了为什么「刷回原厂」比「刷入自制」更危险——很多人是在回滚的时候把设备弄废的。
-
-## 第四步：写入
-
-**机内写入（推荐，不需要电脑）**
-
-root 后直接从手机上写，这是 Operit 环境下最顺的路径：
+在手机上跑（只读，不写任何分区）：
 
 ```bash
-SLOT=$(getprop ro.boot.slot_suffix)
-dd if=/sdcard/Download/Operit/kernel-dev/out/boot.img of=/dev/block/by-name/boot${SLOT} bs=4096
-# 若是 AK3 zip，用 Kernel Flasher 之类的应用刷更稳（它会自己做槽位与 vbmeta 处理）
+bash skills/safe-kernel-flash/scripts/preflight-flash.sh \
+  --zip /sdcard/Download/Operit/kernel-dev/out/<包名>.zip \
+  --pc-rollback <PC 上放回滚镜像的目录>
 ```
 
-写之前确认镜像大小 ≤ 分区大小，且 `of=` 指向的是**带槽位后缀**的正确分区。
-
-**fastboot 写入**
+PC 侧先生成回滚清单，脚本会逐字核对：
 
 ```bash
-fastboot getvar current-slot          # 读槽位，不要写死 a
-fastboot flash boot${SLOT} boot.img
+md5sum stock-boot.img boot_a.img init_boot_a.img > rollback-manifest.txt
+```
+
+**手工也要过一遍的真值检查**（`getprop` 在这台机器上不可信）：
+
+```bash
+# 1) 启动参数真值 —— 只信 /proc/bootconfig
+grep -E 'vbmeta.device_state|verifiedbootstate|hardware.sku' /proc/bootconfig
+#    androidboot.vbmeta.device_state = "unlocked"
+#    androidboot.verifiedbootstate   = "orange"
+
+# 2) BL 状态：getprop 是被伪造的，只能用来对照，不能用来判断
+getprop ro.boot.flash.locked         # 报 1（=锁定）—— 假的
+getprop ro.boot.verifiedbootstate    # 报 green      —— 假的
+```
+
+本机装了 YH_YC / tricky_store / playintegrityfix 这类隐藏模块，`resetprop` 会把上面两个属性改成「已锁定 / green」。**拿 `ro.boot.flash.locked=1` 当真值，会把一台已经解锁的设备判成锁着。** 注意两个字段语义相反：`flash.locked` 是 `1=锁`，`vbmeta.device_state` 是 `unlocked` / `locked`。
+
+```bash
+# 3) 当前基线（刷完要跟它比）
+uname -r
+grep -o 'boot_index=[0-9]*' /proc/cmdline
+
+# 4) 分区存在性与尺寸
+ls -l /dev/block/by-name/boot_a /dev/block/by-name/init_boot_a
+
+# 5) 电量 ≥ 60%
+dumpsys battery | grep level
+```
+
+## 刷入
+
+**方式 A：机内 AK3（推荐）** —— 把 zip 放到设备上，用 Kernel Flasher / Horizon Kernel Flasher / SukiSU 刷：AK3 解包当前 `boot`、只替换 `Image`、重新打包写回。
+
+> **`do.devicecheck=1` 是假防呆。** 这个 AK3 fork 的 `tools/ak3-core.sh` **根本没实现 devicecheck**（`grep -c devicecheck ak3-core.sh` = **0**），设了只是写一个没人读的变量。要防呆必须在 `anykernel.sh` 里自建：读 `/proc/bootconfig` 的 `hardware.sku`，匹配 `"pudding"` / `"canoe"`，否则 `abort`。提 devicecheck 就必须同时提这个陷阱。
+
+**方式 B：PC fastboot**（需要 `.img`，不是 AK3 zip）：
+
+```bash
+fastboot devices
+fastboot getvar current-slot
+fastboot flash boot_a boot-new.img     # 只刷当前槽
 fastboot reboot
 ```
 
-只写**当前**槽位。**不要双写**：`SLOT_SELECT=both` 或连续刷两个槽，会让「换槽启动」这个免费的回滚手段消失。
-
-## 第五步：vbmeta —— 默认不动
-
-重新打包 boot 会让该分区的 AVB 哈希失效。但**不要在流程里例行执行**：
+**PC → 手机传文件（USB adb 不可用时实测可用）**：手机侧起一个 HTTP 接收服务，PC 侧主动 POST 上去。
 
 ```bash
-# 不要当成常规步骤
-fastboot --disable-verity --disable-verification flash vbmeta ...
+# 手机侧
+python3 upload_recv.py 9999 /sdcard/Download/Operit/kernel-dev
+# PC 侧（<手机IP> 用占位符，别写死）
+curl -X POST --data-binary @file.zip http://<手机IP>:9999/file.zip
 ```
 
-在 HyperOS 上，刷一个来路不明的 vbmeta 本身就是主要的变砖来源。正确顺序：
+方向不能反：PC → 手机的**出站**连接不受 Windows 防火墙影响；反过来（PC 起服务、手机去连）会被入站规则拦掉。
 
-1. 只刷 boot，试着开机。
-2. 只有**明确出现** verity / vbmeta 相关错误（`dm-verity` 报错、落到 recovery、`Your device is corrupt`）时，才考虑 vbmeta。
-3. 动手前确认**原始 vbmeta 已经 dd 备份**。
-4. 一次只改一项，改完立刻验证能否开机。
-
-## 第六步：刷完立刻验证
+## 刷后验证（必须上机跑，跑不出结果就不许说成功）
 
 ```bash
-uname -r                # 是否变成你编译的那个版本（应含你的 localversion）
-cat /proc/version
-dmesg | grep -iE 'panic|watchdog|soft lockup|hung task|BUG:|Oops'
+uname -r                      # 6.12.69-android16-6-4k-<署名后缀>（或你的 localversion）
+grep -o 'boot_index=[0-9]*' /proc/cmdline     # 应该是新的一轮
+dmesg | grep -ic 'disagrees about version\|Unknown symbol'   # 期望 0
+lsmod | wc -l                                  # 期望 ~670
+/data/adb/ksud -V                              # root 还在
+ls /dev/dri/                                   # card0 + renderD128
+lsmod | grep -c msm_drm                        # 1（显示栈起来了）
+ip link | grep wlan0
+ls /dev/video0
+cat /proc/asound/cards                         # canoe-mtp-snd-card
+dmesg | grep -ic 'kernel panic\|Oops'          # 期望 0
 ```
 
-`uname -r` 没变 = 你刷的不是你以为的那个分区（去对一下槽位）。
+两条口径纪律：
 
-## 恢复阶梯（按顺序试，别跳）
+- **`uname -r` 没变 = 你刷的不是你以为的那个分区。** 先去对槽位，不要急着再刷一次。
+- **模块数必须同口径对比**：`660`（`/proc/modules` 全量，原厂）/ `670`（本仓成功版）/ `336`（`dmesg` 里带 `(O)` / `(OE)` 标记的口径）。拿 670 去比 336 会得出「模块掉了」的错误结论。
 
-| 层级 | 手段 | 前提 |
-| --- | --- | --- |
-| 1 | 机内 dd 刷回备份的 boot | 系统还能起来（哪怕只是短暂起来） |
-| 2 | `fastboot flash boot${SLOT} 原厂boot.img` | 能进 fastboot |
-| 3 | `fastboot set_active <另一槽>` | 另一槽是原厂 |
-| 4 | 从官方包**只取** boot/init_boot/vbmeta 单刷 | 绝不跑整包（见 ARB） |
-| 5 | EDL / 9008 模式恢复 | 通常需要授权或送修，**不要提前假设它可用** |
+刷后**必须上机验证才允许声称成功**。包完整、ABI 对齐、哈希一致，都不能代替 `uname -r` + `boot_index`。
+
+## 卡住时怎么自救
+
+**症状（三次完全一致）**：刷入 → 卡在开机第一屏（XBL splash logo），无声音、无振动、不自动重启；或者一分多钟后屏幕下缘闪一下 → 自动重启 → 循环。
+
+**关键观察：XBL 层按键仍可交互 → 这不是全局硬死锁，是内核或显示链路挂起。** 所以还能救。
+
+**恢复动作（实测成功，记录在案两次以上）—— 全程在 PC 上完成，手机侧的 AI 助手此刻不可用：**
+
+```
+1. 长按 音量下 + 电源（一次）      → 进 fastboot
+2. PC: fastboot devices            → 确认设备可见
+3. PC: fastboot flash boot_a stock-boot.img
+4. fastboot reboot                 → 正常开机
+```
+
+**为什么必须手动**：fastboot 阶段 Android 没起来，手机侧助手不可用；而且 **fastboot 阶段读不到手机内部存储**，回滚镜像必须刷机前就在 PC 上。
+
+**本方案没有 panic 自动重启配置** —— 卡住不会自己重启，必须手动复位。
+
+### 取证陷阱：按键复位会让你拿不到任何日志
+
+用按键触发的 **PSHOLD warm reset 不走内核 reboot 路径** → 不调 `panic()` → 不触发 `kmsg_dump()` → **printk ring buffer 与 ramoops 全部随内存丢失**。
+
+所以「卡住 → 按键重启 → 想看日志」这个做法**本身就是取证失败的原因**，加多少 printk 都没用。
+
+黑盒里还能看到的（blackbox 分区）：
+
+```
+Loading Image boot_a Done
+PM: Reset by PSHOLD
+the stored_rollback_index is: 1
+Hard watchdog permanently disabled
+```
+
+归属判定纪律：解析取证分区时**必须用版本串 / 署名做归属**（`<署名后缀>`、`6.12.93` 这类），不能看到「有日志」就以为是自己这一轮写的——曾被 bootmonitor 归档进来的上一轮日志骗过一次。
 
 ## Common Mistakes
 
 | 错误 | 后果 | 正确做法 |
 | --- | --- | --- |
-| 没备份就刷 | 无可挽回 | 先备份并拷出机外 + 校验和 |
-| 双写两个槽 | 免费的回滚手段消失 | 只写当前槽 |
-| 把 `--disable-verity` 当常规步骤 | 在 HyperOS 上是主要变砖源 | 只在必要时动，且先备份 vbmeta |
-| 槽位写死 `a` | 刷错分区 | `fastboot getvar current-slot` / `ro.boot.slot_suffix` |
-| 回滚时跑整包 fastboot 固件 | **触发 ARB，不可逆变砖** | 只单刷 boot 类分区 |
-| `fastboot erase` 任何东西 | 抹掉 persist / modemst → 基带、传感器永久损坏 | 不 erase |
-| 重新锁 BL | 变砖且不可逆 | 永远不要在刷第三方内核后锁 BL |
-| 刷完不看 `uname -r` | 以为刷成功，其实是刷进了另一槽或没生效 | 立刻验证 |
-| 假设 EDL 一定能用 | 关键时刻发现进不去 | 把它当最后手段，不是计划的一环 |
+| 回滚镜像只留在手机里 | fastboot 阶段读不到，等于没有 | 刷机前拷到 PC，并核对 md5 |
+| 没备份就开刷 | 没有第二句话可说 | 先备份 + 机外副本 + md5 |
+| 刷 `init_boot` | 抹掉 KSU 补丁，root 没了 | 只刷 `boot_a`；`init_boot` 只备份不动 |
+| 跑 `flash_all` / 整包脚本 | **触发 ARB，不可逆** | 只单刷 `boot_a` |
+| 用降级当回滚手段 | 同样的 ARB 风险 | 回滚用机外备份的 `boot_a` 镜像 |
+| 拿 `getprop ro.boot.flash.locked` 判断 BL | 已解锁的机器被判成锁着（或反过来） | 一律读 `/proc/bootconfig` |
+| `SLOT_SELECT=both` 双写 | 免费的回滚手段归零 | 只写当前槽 |
+| 信 `do.devicecheck=1` | 防呆没生效，包可能刷到别的机器 | 在 `anykernel.sh` 里自建 `hardware.sku` 校验 |
+| 刷完不看 `uname -r` / `boot_index` | 以为成功，其实刷进了另一槽或没生效 | 上机逐条跑刷后验证 |
+| 模块数跨口径对比（670 vs 336） | 误判「模块掉了」 | 同口径比：660 / 670 / 336 各自成组 |
+| 按键复位后去 pstore 找日志 | 什么都找不到，白花时间 | 记住 PSHOLD 不走 `kmsg_dump()`；要取证得另设计 |
+| 假设 EDL(9008) 一定能兜底 | 关键时刻发现进不去 | EDL 状态 `UNKNOWN`，不能当计划的一环 |
 
 ## Real-World Impact
 
-基线里 agent 的流程基本正确（校验 hash → 读槽位 → dd 备份 → 只刷单槽 → 重启），但**完全没提 ARB**，而且把 `--disable-verity --disable-verification flash vbmeta` 当成了常规步骤、槽位写死 `a`。三条里两条指向同一个方向的错误：**把「让这次刷机能开机」当成目标，而不是「让自己随时能退回去」**。
+三次失败刷机（`boot_index` 354 / 356 / 361·362），三次都卡在 XBL 第一屏；恢复动作（音量下 + 电源 → fastboot → PC 单刷 `stock-boot.img`）**实测自助恢复成功两次**，均记录在案。结论不是「内核难编」，而是**「回滚路径是不是在开刷之前就存在」这件事决定了一切**。
+
+另一个真实陷阱：本机 `getprop ro.boot.flash.locked` 报 `1`、`ro.boot.verifiedbootstate` 报 `green`，而 `/proc/bootconfig` 是 `unlocked` / `orange`。**把 `getprop` 当真值，会把一台已经解锁的设备判成锁着**，然后得出「不能刷」的错误结论——反过来的误判（把锁着的机器当成能刷）是硬砖。
+
+## UNKNOWN / UNVERIFIED
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| ARB 指数 | `UNKNOWN` | 机内 `ro.boot.anti` 为空；需 `fastboot getvar anti`。侧面证据 `stored_rollback_index is: 1` 多轮一致，未见变化 |
+| EDL(9008) 兜底 | `UNKNOWN` | 硬件通道存在（UFS 多 LUN），是否需要授权文件未验证 |
+| 主动取证方案 | `UNVERIFIED` | 让卡死轮也能留下日志的做法（panic 自动重启 + pstore 落盘之类）**没有实测过** |
+
+## 相关 skill
+
+- **REQUIRED SUB-SKILL:** `xiaomi17-device-recon` —— `device-profile.md` / `build.env` 是所有事实的来源。
+- **REQUIRED SUB-SKILL:** `anykernel3-packaging` —— 刷之前先验包结构与 `anykernel.sh` 的键。
+- **root 会不会掉**：只看 `ROOT_PARTITION` 指的那个分区有没有被动过。GKI 设备上内核在 `boot`、通用 ramdisk 在 `init_boot`，而这台设备的 KernelSU **LKM** 补丁装在 `init_boot` —— **只换 `boot` 里的 Image 不会掉 root**（实测两次，`init_boot_a` 的 md5 前后一致）。反过来，`ksud boot-restore` **不能**当回滚手段（它的 `stock_image.sha1` 与你换过的 `boot` 不匹配，会直接拒绝工作）。
+- `kernel-perf-verification` —— 刷成功之后怎么证明它真的更好。
